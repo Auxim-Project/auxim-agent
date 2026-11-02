@@ -6,7 +6,7 @@
     <UseAppHost>true</UseAppHost>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\Auxim.Core\Auxim.Core.csproj" />
+    <PackageReference Include="Auxim.Kernel" Version="$(AuximKernelVersion)" />
     <ProjectReference Include="..\Auxim.Agent\Auxim.Agent.csproj" />
   </ItemGroup>
 </Project>

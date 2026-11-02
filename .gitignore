@@ -1,109 +1,34 @@
-# Build output
+# .NET build, test, and package output
 bin/
 obj/
-dist/
-out/
-publish/
 artifacts/
 TestResults/
 *.trx
-*.testlog
-coverage/
-coverage.xml
-*.coverage
-*.coveragexml
-*.lcov
-lcov.info
+*.nupkg
+*.snupkg
+*.binlog
 
-# Local published app symlink/binary
-/auxim
-/auxim.exe
-*.tar.gz
-*.zip
-*.7z
+# Local IDE and editor state
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.DotSettings.user
+*.swp
+*.swo
+*~
 
-# User secrets and local Auxim state
+# Local configuration
 .env
 .env.*
 !.env.example
-.envrc
-.env.local
-.env.*.local
-.auxim/
-config.local.json
 *.local.json
 *.secret.json
 secrets.json
-approvals.json
-todos.json
-current_session
-sessions/
-logs/
-*.log
-*.db
-*.sqlite
-*.sqlite3
 
-# .NET and NuGet
-*.nupkg
-*.snupkg
-packages/
-project.lock.json
-project.assets.json
-*.nuget.g.props
-*.nuget.g.targets
-*.nuget.dgspec.json
-
-# Visual Studio
-.vs/
-*.user
-*.suo
-*.userosscache
-*.sln.docstates
-
-# JetBrains Rider
-.idea/
-*.DotSettings.user
-
-# VS Code
-.vscode/
-
-# Vim/Emacs/editor swap files
-*.swp
-*.swo
-*.swn
-\#*\#
-.\#*
-
-# Local runtime plugin binaries
-plugins/**/*.dll
-plugins/**/*.pdb
-plugins/**/*.so
-plugins/**/*.dylib
-
-# macOS files
+# Operating-system files
 .DS_Store
-.AppleDouble
-.LSOverride
 ._*
-
-# Windows files
 Thumbs.db
-ehthumbs.db
 Desktop.ini
-$RECYCLE.BIN/
-*.lnk
-
-# Linux desktop files
-.directory
-
-# Crash dumps and temporary files
-*.dmp
-*.dump
-*.core
-!src/Auxim.Core/
-*.tmp
-*.temp
-*.bak
-*.orig
-*~

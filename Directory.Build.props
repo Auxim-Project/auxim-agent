@@ -5,5 +5,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
     <LangVersion>latest</LangVersion>
+    <AuximKernelVersion>0.1.0-alpha.1</AuximKernelVersion>
+    <VersionPrefix>0.1.0</VersionPrefix>
+    <VersionSuffix>alpha.1</VersionSuffix>
   </PropertyGroup>
 </Project>
