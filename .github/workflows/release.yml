@@ -1,0 +1,64 @@
+name: Package Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Prerelease package version
+        required: true
+        default: 0.1.0-alpha.1
+        type: string
+      publish:
+        description: Publish package to NuGet.org
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    env:
+      PACKAGE_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Validate version
+        shell: bash
+        run: |
+          if [[ ! "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+            echo "Version must be a prerelease SemVer value, for example 0.1.0-alpha.1." >&2
+            exit 1
+          fi
+      - name: Restore
+        run: dotnet restore Auxim.Agent.sln --source https://api.nuget.org/v3/index.json
+      - name: Build
+        run: dotnet build Auxim.Agent.sln -c Release --no-restore -p:Version="$PACKAGE_VERSION"
+      - name: Test
+        run: dotnet test Auxim.Agent.sln -c Release --no-build --no-restore -p:Version="$PACKAGE_VERSION"
+      - name: Pack
+        run: dotnet pack src/Auxim.Agent/Auxim.Agent.csproj -c Release --no-build --no-restore -p:Version="$PACKAGE_VERSION" -o artifacts/packages
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: auxim-agent-${{ inputs.version }}
+          path: artifacts/packages/Auxim.Agent.*.nupkg
+          if-no-files-found: error
+      - name: Log in to NuGet.org with Trusted Publishing
+        id: login
+        if: ${{ inputs.publish }}
+        uses: NuGet/login@v1
+        with:
+          user: F4561F
+      - name: Publish to NuGet.org
+        if: ${{ inputs.publish }}
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY }}
+        run: dotnet nuget push "artifacts/packages/Auxim.Agent.*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
