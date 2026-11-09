@@ -10,6 +10,8 @@ internal static class ApprovalRenderer
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        using var inputOwner = TerminalInput.BeginApproval(out var inputFailure);
+        if (inputOwner is null) return ApprovalResponse.Deny(inputFailure ?? "Safe terminal input is unavailable.");
         using var scrollSuspension = TerminalMouse.SuspendAlternateScroll();
         var width = Math.Max(20, Math.Min(ConsoleTheme.ConsoleWidth(), 96));
 
@@ -47,7 +49,6 @@ internal static class ApprovalRenderer
             (Label: "Deny and give feedback", Tone: "danger", Value: 3),
         };
 
-        var optionsTop = Console.CursorTop;
         var selected = 0;
 
         RenderOptions(options, selected, width);
@@ -60,10 +61,10 @@ internal static class ApprovalRenderer
             var input = await TerminalInput.ReadAsync(
                 TerminalInputPolicy.Approval,
                 cancellationToken);
-            if (input.Kind != TerminalInputEventKind.Key)
-            {
-                continue;
-            }
+            if (input.Kind is TerminalInputEventKind.PasteStarted or TerminalInputEventKind.Paste
+                or TerminalInputEventKind.ControlSequence or TerminalInputEventKind.EndOfInput)
+                return ApprovalResponse.Deny("Pasted, ambiguous, or closed terminal input cannot confirm approval. Retry with keyboard input.");
+            if (input.Kind != TerminalInputEventKind.Key) continue;
 
             var key = input.Key;
             switch (key.Key)
@@ -71,23 +72,23 @@ internal static class ApprovalRenderer
                 case ConsoleKey.D1:
                 case ConsoleKey.NumPad1:
                     selected = 0;
-                    RedrawOptions(options, optionsTop, selected, width);
+                    RedrawOptions(options, selected, width);
                     break;
                 case ConsoleKey.D2:
                 case ConsoleKey.NumPad2:
                     selected = 1;
-                    RedrawOptions(options, optionsTop, selected, width);
+                    RedrawOptions(options, selected, width);
                     break;
                 case ConsoleKey.D3:
                 case ConsoleKey.NumPad3:
                     selected = 2;
-                    RedrawOptions(options, optionsTop, selected, width);
+                    RedrawOptions(options, selected, width);
                     break;
                 case ConsoleKey.UpArrow:
                     if (selected > 0)
                     {
                         selected--;
-                        RedrawOptions(options, optionsTop, selected, width);
+                        RedrawOptions(options, selected, width);
                     }
 
                     break;
@@ -95,12 +96,13 @@ internal static class ApprovalRenderer
                     if (selected < options.Length - 1)
                     {
                         selected++;
-                        RedrawOptions(options, optionsTop, selected, width);
+                        RedrawOptions(options, selected, width);
                     }
 
                     break;
                 case ConsoleKey.Enter:
-                    return CompleteSelection(selected, options.Length, optionsTop);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return CompleteSelection(selected, options.Length, cancellationToken);
             }
         }
     }
@@ -108,9 +110,9 @@ internal static class ApprovalRenderer
     private static ApprovalResponse CompleteSelection(
         int selected,
         int optionCount,
-        int optionsTop)
+        CancellationToken cancellationToken)
     {
-        ClearOptionsBlock(optionCount, optionsTop);
+        ClearOptionsBlock(optionCount);
         switch (selected)
         {
             case 0:
@@ -123,7 +125,8 @@ internal static class ApprovalRenderer
                 return ApprovalResponse.Allow(remember: true);
             default:
                 Console.Write(Ansi.Warning("Feedback for the model: "));
-                var reason = Console.ReadLine();
+                var reason = new LineEditor([], _ => []).ReadLine("", "",
+                    inputPolicy: TerminalInputPolicy.Feedback, cancellationToken: cancellationToken);
                 reason = string.IsNullOrWhiteSpace(reason)
                     ? "User denied this tool call."
                     : reason.Trim();
@@ -146,15 +149,15 @@ internal static class ApprovalRenderer
         }
     }
 
-    private static void RedrawOptions((string Label, string Tone, int Value)[] options, int optionsTop, int selected, int width)
+    private static void RedrawOptions((string Label, string Tone, int Value)[] options, int selected, int width)
     {
-        ClearOptionsBlock(options.Length, optionsTop);
+        ClearOptionsBlock(options.Length);
         RenderOptions(options, selected, width);
         RenderHint(width);
         Console.WriteLine(Ansi.Warning($"{TerminalGlyphs.BottomLeft}{TerminalGlyphs.HorizontalLine(width - 2)}{TerminalGlyphs.BottomRight}"));
     }
 
-    private static void ClearOptionsBlock(int optionCount, int optionsTop)
+    private static void ClearOptionsBlock(int optionCount)
     {
         if (Ansi.ControlSequencesEnabled)
         {
@@ -164,14 +167,7 @@ internal static class ApprovalRenderer
             return;
         }
 
-        try
-        {
-            Console.SetCursorPosition(0, optionsTop);
-        }
-        catch
-        {
-            Console.WriteLine();
-        }
+        Console.WriteLine();
     }
 
     private static void RenderHint()

@@ -1,4 +1,5 @@
 using Auxim.Core.Runtime;
+using Auxim.Cli.Interactive;
 
 namespace Auxim.Cli;
 
@@ -165,6 +166,7 @@ public static partial class CommandHandlers
 
     private static string ReadSecret(string prompt)
     {
+        PreparePromptInput();
         Console.Write(prompt);
         if (Console.IsInputRedirected)
         {
@@ -174,7 +176,10 @@ public static partial class CommandHandlers
         var chars = new List<char>();
         while (true)
         {
-            var key = Console.ReadKey(intercept: true);
+            var input = TerminalInput.Read(TerminalInputPolicy.Secret);
+            if (input.Kind == TerminalInputEventKind.EndOfInput) return "";
+            if (input.Kind != TerminalInputEventKind.Key) continue;
+            var key = input.Key;
             if (key.Key is ConsoleKey.Enter)
             {
                 Console.WriteLine();
@@ -198,11 +203,19 @@ public static partial class CommandHandlers
         }
     }
 
+    private static void PreparePromptInput()
+    {
+        if (!Console.IsInputRedirected) _ = TerminalInput.KeyAvailable;
+    }
+
+    private static string? ReadPromptLine() => new LineEditor([], _ => []).ReadLine("", "");
+
     private static string PromptWithDefault(string label, string defaultValue)
     {
         var suffix = string.IsNullOrWhiteSpace(defaultValue) ? "" : $" [{defaultValue}]";
+        PreparePromptInput();
         Console.Write($"{label}{suffix}: ");
-        var value = Console.ReadLine();
+        var value = ReadPromptLine();
         return string.IsNullOrWhiteSpace(value) ? defaultValue : value.Trim();
     }
 
@@ -280,8 +293,9 @@ public static partial class CommandHandlers
     {
         while (true)
         {
+            PreparePromptInput();
             Console.Write($"{label} [1-{maxChoice}, default {defaultChoice}]: ");
-            var raw = Console.ReadLine();
+            var raw = ReadPromptLine();
             if (string.IsNullOrWhiteSpace(raw))
             {
                 return defaultChoice;

@@ -6,7 +6,7 @@ internal static class InteractiveCommandCatalog
     [
         new("/help", "Show this help"),
         new("/exit", "Quit"),
-        new("/new", "Start a new session"),
+        new("/new", "Open New Chat (saved on first send)"),
         new("/session", "Manage sessions"),
         new("/sessions", "List sessions"),
         new("/model", "Show or configure model"),
@@ -22,13 +22,13 @@ internal static class InteractiveCommandCatalog
         new("/show", "Show a single turn by number"),
         new("/jump", "Replay history from a turn number"),
         new("/tail", "Replay recent turns"),
-        new("/resume", "Return to the dashboard"),
+        new("/resume", "Browse saved sessions or resume <id>"),
         new("/status", "Show interface and runtime status"),
         new("/shortcuts", "Show keyboard shortcuts"),
         new("/paste", "Enter multiline input"),
         new("/clear", "Clear screen"),
         new("/redraw", "Redraw the interface"),
-        new("/welcome", "Show the start dashboard"),
+        new("/welcome", "Show New Chat"),
         new("//", "Run a command in your real shell"),
     ];
 

@@ -9,6 +9,12 @@ public static partial class CommandHandlers
         IReadOnlyList<string> args,
         IAuximRuntime runtime)
     {
+        return await HandleToolWithCancellation(args, runtime, CancellationToken.None);
+    }
+
+    internal static async Task<int> HandleToolWithCancellation(
+        IReadOnlyList<string> args, IAuximRuntime runtime, CancellationToken cancellationToken)
+    {
         var subcommand = args.FirstOrDefault() ?? "list";
         switch (subcommand)
         {
@@ -30,7 +36,7 @@ public static partial class CommandHandlers
                 Console.WriteLine(await runtime.InvokeToolAsync(
                     toolName,
                     toolArgs,
-                    new AuximRuntimeOptions { ApprovalHandler = new CliApprovalHandler() }));
+                    new AuximRuntimeOptions { ApprovalHandler = new CliApprovalHandler() }, cancellationToken));
                 return 0;
             default:
                 return PrintToolHelp();

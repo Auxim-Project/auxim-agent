@@ -1,5 +1,7 @@
 namespace Auxim.Cli.Interactive;
 
+internal enum TerminalColorDepth { Basic, Indexed, TrueColor }
+
 internal static class Ansi
 {
     public static bool Enabled =>
@@ -15,35 +17,64 @@ internal static class Ansi
 
     public static string Dim(string text) => Wrap("2", text);
 
-    public static string Accent(string text) => Wrap("36", text);
+    public static string Accent(string text) => Color(text, 156, 151, 219, 140, 95);
+    public static string Text(string text) => Color(text, 240, 240, 243, 255, 37);
+    public static bool SupportsSurfaces => Enabled && ColorDepth != TerminalColorDepth.Basic;
+    public static string FocusBoundary(string text) => Enabled ? "\u001b[49m" + Accent(text) : text;
+    public static string Edge(string text) => Color(text, 65, 72, 87, 239, 90);
+    public static string Composer(string text) => Background(text, 32, 37, 48, 235, 40);
 
-    public static string Success(string text) => Wrap("32", text);
+    internal static TerminalColorDepth DetectColorDepth(string? colorTerm, string? term) =>
+        string.Equals(colorTerm, "truecolor", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(colorTerm, "24bit", StringComparison.OrdinalIgnoreCase)
+        || (term?.Contains("direct", StringComparison.OrdinalIgnoreCase) ?? false)
+            ? TerminalColorDepth.TrueColor
+            : (term?.Contains("256color", StringComparison.OrdinalIgnoreCase) ?? false)
+                ? TerminalColorDepth.Indexed : TerminalColorDepth.Basic;
 
-    public static string Warning(string text) => Wrap("33", text);
+    private static TerminalColorDepth ColorDepth => DetectColorDepth(
+        Environment.GetEnvironmentVariable("COLORTERM"), Environment.GetEnvironmentVariable("TERM"));
 
-    public static string Error(string text) => Wrap("31", text);
+    internal static string ColorCode(TerminalColorDepth depth, int r, int g, int b, int index, int basic, bool background = false) =>
+        depth switch
+        {
+            TerminalColorDepth.TrueColor => $"{(background ? 48 : 38)};2;{r};{g};{b}",
+            TerminalColorDepth.Indexed => $"{(background ? 48 : 38)};5;{index}",
+            _ => basic.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        };
 
-    public static string Muted(string text) => Wrap("90", text);
+    private static string Color(string text, int r, int g, int b, int index, int basic) =>
+        Wrap(ColorCode(ColorDepth, r, g, b, index, basic), text);
+    private static string Background(string text, int r, int g, int b, int index, int basic) =>
+        Wrap(ColorCode(ColorDepth, r, g, b, index, basic, true), text);
+
+    public static string Success(string text) => Color(text, 152, 192, 163, 151, 32);
+
+    public static string Warning(string text) => Color(text, 212, 180, 131, 180, 33);
+
+    public static string Error(string text) => Color(text, 219, 150, 150, 174, 31);
+
+    public static string Muted(string text) => Color(text, 154, 159, 171, 247, 90);
 
     public static string Reverse(string text) => Wrap("7", text);
 
-    public static string AccentBackground(string text) => Wrap("30;46", text);
+    public static string AccentBackground(string text) => Composer(Accent(text));
 
-    public static string WarningBackground(string text) => Wrap("30;43", text);
+    public static string WarningBackground(string text) => Composer(Warning(text));
 
-    public static string ErrorBackground(string text) => Wrap("97;41", text);
+    public static string ErrorBackground(string text) => Composer(Error(text));
 
-    public static string Cyan(string text) => Wrap("96", text);
+    public static string Cyan(string text) => Accent(text);
 
-    public static string Blue(string text) => Wrap("34", text);
+    public static string Blue(string text) => Accent(text);
 
-    public static string Magenta(string text) => Wrap("35", text);
+    public static string Magenta(string text) => Accent(text);
 
-    public static string SoftBackground(string text) => Wrap("30;47", text);
+    public static string SoftBackground(string text) => Composer(Text(text));
 
     private static string Wrap(string code, string text)
     {
-        return Enabled ? $"\u001b[{code}m{text}\u001b[0m" : text;
+        return Enabled ? $"\u001b[{code}m{text.Replace("\u001b[0m", $"\u001b[0m\u001b[{code}m", StringComparison.Ordinal)}\u001b[0m" : text;
     }
 
     private static bool WindowsVirtualTerminalLikelyEnabled()

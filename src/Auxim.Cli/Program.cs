@@ -5,6 +5,7 @@ using Auxim.Agent;
 using Auxim.Core.Runtime;
 
 ConsoleHost.Configure();
+if (args is ["--diagnose-input"]) return TerminalInputDiagnostic.Run();
 IAuximRuntime runtime = AuximApplication.CreateRuntime();
 
 try

@@ -31,6 +31,7 @@ internal sealed class InteractiveScreen : IDisposable
             return new InteractiveScreen(enabled: false);
         }
 
+        TerminalInput.Restore(); // Pop on the old screen before changing its stack.
         WriteAndFlush("\u001b[?1049h\u001b[?25h");
         WriteAndFlush("\u001b]0;Auxim\u0007");
 
@@ -72,6 +73,7 @@ internal sealed class InteractiveScreen : IDisposable
 
     public void Dispose()
     {
+        TerminalInput.Restore();
         if (_disposed)
         {
             return;
@@ -90,6 +92,7 @@ internal sealed class InteractiveScreen : IDisposable
 
     internal static void EmergencyCleanup()
     {
+        TerminalInput.Restore();
         if (!IsAlternateScreenActive || !Ansi.ControlSequencesEnabled)
         {
             return;
@@ -102,6 +105,7 @@ internal sealed class InteractiveScreen : IDisposable
 
     private static void FullCleanup()
     {
+        TerminalInput.Restore();
         if (!Ansi.ControlSequencesEnabled)
         {
             return;
@@ -118,6 +122,7 @@ internal sealed class InteractiveScreen : IDisposable
             PosixSignalRegistration.Create(signal, context =>
             {
                 context.Cancel = true;
+                if (signal == PosixSignal.SIGINT && InteractiveInterrupt.Current is not null) return;
                 FullCleanup();
                 Console.ResetColor();
                 Environment.Exit(128 + signum);

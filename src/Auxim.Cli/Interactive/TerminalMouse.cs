@@ -1,106 +1,69 @@
 namespace Auxim.Cli.Interactive;
 
+internal enum TerminalMouseMode { Off, Normal, Drag }
+
 internal static class TerminalMouse
 {
     private static readonly object Sync = new();
-    private static bool _alternateScrollEnabled;
+    public static TerminalMouseMode Mode { get; private set; }
+    public static long Revision { get; private set; }
 
     public static void Reset()
     {
-        if (!Ansi.ControlSequencesEnabled)
-        {
-            return;
-        }
-
         lock (Sync)
         {
-            WriteAndFlush("\u001b[?1007l\u001b[?1006l\u001b[?1003l\u001b[?1002l\u001b[?1000l");
-            _alternateScrollEnabled = false;
+            if (Ansi.ControlSequencesEnabled)
+                WriteAndFlush("\u001b[?1007l\u001b[?1006l\u001b[?1003l\u001b[?1002l\u001b[?1000l");
+            Mode = TerminalMouseMode.Off;
+            Revision++;
         }
     }
 
-    public static void EnableAlternateScroll()
+    public static void SetMode(TerminalMouseMode mode)
     {
-        if (!Ansi.ControlSequencesEnabled)
-        {
-            return;
-        }
-
+        if (!Ansi.ControlSequencesEnabled || mode != TerminalMouseMode.Off && !TerminalInput.SupportsMouseReports)
+            mode = TerminalMouseMode.Off;
         lock (Sync)
         {
-            if (_alternateScrollEnabled)
+            if (Mode == mode) return;
+            if (Ansi.ControlSequencesEnabled)
             {
-                return;
+                // Never use 1007: wheel and physical arrows must remain distinct.
+                WriteAndFlush("\u001b[?1007l\u001b[?1003l\u001b[?1002l\u001b[?1000l");
+                WriteAndFlush(mode == TerminalMouseMode.Off ? "\u001b[?1006l"
+                    : "\u001b[?1005l\u001b[?1015l\u001b[?1006h" + (mode == TerminalMouseMode.Drag ? "\u001b[?1002h" : "\u001b[?1000h"));
             }
-
-            // 1007 translates wheel movement into cursor keys without taking
-            // click and drag events away from the terminal's text selection.
-            WriteAndFlush("\u001b[?1003l\u001b[?1002l\u001b[?1000l\u001b[?1006l\u001b[?1007h");
-            _alternateScrollEnabled = true;
+            Mode = mode;
+            Revision++;
         }
     }
 
-    public static void DisableAlternateScroll()
-    {
-        if (!Ansi.ControlSequencesEnabled)
-        {
-            return;
-        }
-
-        lock (Sync)
-        {
-            if (!_alternateScrollEnabled)
-            {
-                return;
-            }
-
-            WriteAndFlush("\u001b[?1007l");
-            _alternateScrollEnabled = false;
-        }
-    }
+    public static void EnableAlternateScroll() => SetMode(TerminalMouseMode.Normal);
+    public static void DisableAlternateScroll() => SetMode(TerminalMouseMode.Off);
 
     public static IDisposable SuspendAlternateScroll()
     {
-        bool restore;
-        lock (Sync)
-        {
-            restore = _alternateScrollEnabled;
-        }
-
-        DisableAlternateScroll();
-        return new AlternateScrollSuspension(restore);
+        // A press is never resumed after another foreground owner: its release
+        // might have been consumed there. Restore reports, never a held drag.
+        var restore = Mode == TerminalMouseMode.Off ? TerminalMouseMode.Off : TerminalMouseMode.Normal;
+        SetMode(TerminalMouseMode.Off);
+        return new Suspension(restore);
     }
 
     private static void WriteAndFlush(string text)
     {
-        try
-        {
-            Console.Out.Write(text);
-            Console.Out.Flush();
-        }
-        catch
-        {
-            // stdout may already be closed during shutdown.
-        }
+        try { Console.Out.Write(text); Console.Out.Flush(); }
+        catch { /* The terminal may already be closed during cleanup. */ }
     }
 
-    private sealed class AlternateScrollSuspension(bool restore) : IDisposable
+    private sealed class Suspension(TerminalMouseMode restore) : IDisposable
     {
         private bool _disposed;
-
         public void Dispose()
         {
-            if (_disposed)
-            {
-                return;
-            }
-
-            if (restore)
-            {
-                EnableAlternateScroll();
-            }
-
+            if (_disposed) return;
             _disposed = true;
+            SetMode(restore);
         }
     }
 }

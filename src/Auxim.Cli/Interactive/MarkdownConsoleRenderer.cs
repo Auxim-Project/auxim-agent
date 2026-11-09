@@ -12,6 +12,9 @@ internal static class MarkdownConsoleRenderer
 
     public static IReadOnlyList<string> RenderToLines(string markdown)
     {
+        // Model echoes and saved messages may contain literal pasted controls.
+        // Keep them in the message, but never execute them on the terminal.
+        markdown = TerminalTextLayout.Plain(markdown);
         var inCodeBlock = false;
         var codeLanguage = "";
         var lines = new List<string>();
@@ -98,7 +101,7 @@ internal static class MarkdownConsoleRenderer
 
         if (level <= 2)
         {
-            return ["", Ansi.Bold(Ansi.Accent(text)), ConsoleTheme.RuleText()];
+            return ["", Ansi.Bold(text)];
         }
 
         return [Ansi.Bold(text)];
