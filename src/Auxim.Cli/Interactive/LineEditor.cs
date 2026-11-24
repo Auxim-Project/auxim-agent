@@ -15,7 +15,12 @@ internal sealed class LineEditor
     private readonly Func<int, ScreenLayout?>? _inputLayout;
     private ScreenLayout? _lastLayout;
     private readonly InputDraft _draft = new();
-    private string? _suggestions;
+    private IReadOnlyList<string>? _suggestions;
+    private int _selectedSuggestion;
+    private int _completionEnd;
+    private readonly List<(int From, int To, int Index)> _suggestionHits = [];
+    private readonly Func<TerminalPointer, string?>? _quickAction;
+    private readonly Func<bool>? _expandResult;
     private bool _clearSuggestions;
     private Func<bool>? _canGoBack;
     private readonly Func<bool>? _isNewChat;
@@ -36,6 +41,7 @@ internal sealed class LineEditor
     private readonly Func<bool>? _historyTextSelection;
     private readonly Func<bool>? _toggleHistoryTextSelection;
     private long _dragRevision;
+    private readonly InteractiveView? _historyView;
 
     public LineEditor(
         IReadOnlyList<string> history,
@@ -48,9 +54,15 @@ internal sealed class LineEditor
         Func<bool>? canPointComposer = null,
         Func<bool>? historyTextSelection = null,
         Func<bool>? toggleHistoryTextSelection = null,
-        Func<int, InputSubmissionKind?>? historyKind = null)
+        Func<int, InputSubmissionKind?>? historyKind = null,
+        Func<TerminalPointer, string?>? quickAction = null,
+        Func<bool>? expandResult = null,
+        InteractiveView? historyView = null)
     {
         _history = history;
+        _quickAction = quickAction;
+        _expandResult = expandResult;
+        _historyView = historyView;
         _historyKind = historyKind;
         _completionProvider = completionProvider;
         _scrollHandler = scrollHandler;
@@ -109,9 +121,9 @@ internal sealed class LineEditor
             while (true)
             {
                 SynchronizeMouse();
-                HandleIdleInterrupt(prompt, visiblePrompt);
+                if (inputPolicy != TerminalInputPolicy.ConfigurationPrompt) HandleIdleInterrupt(prompt, visiblePrompt);
                 cancellationToken.ThrowIfCancellationRequested();
-                if (inputPolicy != TerminalInputPolicy.Feedback)
+                if (inputPolicy != TerminalInputPolicy.Feedback && inputPolicy != TerminalInputPolicy.ConfigurationPrompt)
                 {
                     while (!TerminalInput.KeyAvailable)
                     {
@@ -125,12 +137,45 @@ internal sealed class LineEditor
                         }
                         else if (_acceptPaste && (TerminalWidth() != _lastTerminalWidth || TerminalHeight() != _lastTerminalHeight))
                             Render(prompt, visiblePrompt, buffer, cursor);
+                        if (_suggestions is null) _historyView?.TickHistorySelection();
                         Thread.Sleep(25);
                     }
                 }
-                var input = TerminalInput.Read(inputPolicy ?? TerminalInputPolicy.LineEditor, cancellationToken);
+                var historyInput = _acceptPaste && inputPolicy is null && _historyView?.CanInteractWithHistory == true;
+                var input = TerminalInput.Read(inputPolicy ?? (historyInput ? TerminalInputPolicy.HistoryEditor : TerminalInputPolicy.LineEditor), cancellationToken);
+                var completionOwnsInput = _suggestions is not null && (input.Key.Key == ConsoleKey.Escape
+                    || input.Pointer is { } pointerOverHint && pointerOverHint.Y == _lastLayout?.HintRow);
+                if (historyInput && !completionOwnsInput && _historyView!.HandleHistoryInput(input))
+                {
+                    _pointerSelection.Cancel();
+                    SynchronizeMouse();
+                    if (_suggestions is not null) Render(prompt, visiblePrompt, buffer, cursor);
+                    continue;
+                }
                 if (input.Kind == TerminalInputEventKind.Pointer)
                 {
+                    if (_acceptPaste && input.Pointer is { Button: 0, Phase: PointerPhase.Press, Modifiers: 0 } click)
+                    {
+                        if (_suggestions is not null && _lastLayout is { } menuLayout && click.Y == menuLayout.HintRow
+                            && _inputLayout?.Invoke(_draft.RequestedRows) == menuLayout)
+                        {
+                            foreach (var hit in _suggestionHits)
+                            {
+                                if (click.X < hit.From || click.X >= hit.To) continue;
+                                _selectedSuggestion = hit.Index;
+                                AcceptSuggestion(buffer, ref cursor);
+                                Render(prompt, visiblePrompt, buffer, cursor);
+                                break;
+                            }
+                            continue;
+                        }
+                        if (buffer.Length == 0 && _quickAction?.Invoke(click) is { } action)
+                        {
+                            _draft.InsertText(action);
+                            Render(prompt, visiblePrompt, buffer, cursor);
+                            continue;
+                        }
+                    }
                     if (_acceptPaste && _canPointComposer?.Invoke() == true && _historyTextSelection?.Invoke() != true
                         && _lastLayout is { } pointerLayout && input.Pointer is { } pointer
                         && _pointerSelection.Handle(pointer, _draft, pointerLayout, Environment.TickCount64))
@@ -180,6 +225,27 @@ internal sealed class LineEditor
                 }
 
                 var key = input.Key;
+                if (_acceptPaste && key is { Key: ConsoleKey.F3, Modifiers: 0 } && _expandResult?.Invoke() == true)
+                {
+                    Render(prompt, visiblePrompt, buffer, cursor);
+                    continue;
+                }
+                if (_suggestions is { } options && key.Modifiers == 0)
+                {
+                    if (key.Key is ConsoleKey.UpArrow or ConsoleKey.LeftArrow or ConsoleKey.DownArrow or ConsoleKey.RightArrow)
+                    {
+                        var delta = key.Key is ConsoleKey.UpArrow or ConsoleKey.LeftArrow ? -1 : 1;
+                        _selectedSuggestion = (_selectedSuggestion + delta + options.Count) % options.Count;
+                        ShowSuggestions(prompt, visiblePrompt, buffer, cursor);
+                        continue;
+                    }
+                    if (key.Key is ConsoleKey.Tab or ConsoleKey.Enter)
+                    {
+                        AcceptSuggestion(buffer, ref cursor);
+                        Render(prompt, visiblePrompt, buffer, cursor);
+                        continue;
+                    }
+                }
                 if (_acceptPaste && key.Key == ConsoleKey.Escape && _draft.HasSelection)
                 {
                     _draft.SelectionAnchor = null;
@@ -189,6 +255,15 @@ internal sealed class LineEditor
                 if (key.Key is ConsoleKey.Backspace or ConsoleKey.Delete or ConsoleKey.LeftArrow
                     or ConsoleKey.RightArrow or ConsoleKey.Home or ConsoleKey.End or ConsoleKey.Tab
                     || !char.IsControl(key.KeyChar)) _draft.ResetPreferredColumn();
+                if (_acceptPaste && (key.Key == ConsoleKey.F2 && key.Modifiers == 0
+                    || key.Key == ConsoleKey.R && key.Modifiers == ConsoleModifiers.Control)
+                    && _toggleHistoryTextSelection?.Invoke() == true)
+                {
+                    _suggestions = null;
+                    _clearSuggestions = false;
+                    SynchronizeMouse();
+                    continue;
+                }
                 var hadSuggestions = _suggestions is not null;
                 if (hadSuggestions)
                 {
@@ -198,14 +273,6 @@ internal sealed class LineEditor
                 }
                 switch (key.Key)
                 {
-                    case ConsoleKey.R when _acceptPaste && key.Modifiers == ConsoleModifiers.Control:
-                        if (_toggleHistoryTextSelection?.Invoke() == true)
-                        {
-                            SynchronizeMouse();
-                            _clearSuggestions = false;
-                            Render(prompt, visiblePrompt, buffer, cursor);
-                        }
-                        break;
                     case ConsoleKey.A when _acceptPaste && key.Modifiers == ConsoleModifiers.Control:
                         _draft.SelectAll();
                         Render(prompt, visiblePrompt, buffer, cursor);
@@ -217,7 +284,6 @@ internal sealed class LineEditor
                             if (wasNewChat) _newChatDraft = _draft.Copy();
                             else _mainDraft = _draft.Copy();
                             navigateBack?.Invoke();
-                            TerminalInput.DiscardQueuedNavigation();
                             if (wasNewChat != (_isNewChat?.Invoke() == true)) LoadDraft(_isNewChat?.Invoke() == true);
                             ResetRenderState();
                             Render(prompt, visiblePrompt, buffer, cursor);
@@ -233,7 +299,7 @@ internal sealed class LineEditor
                         EndInput();
                         return buffer.ToString();
                     case ConsoleKey.D when key.Modifiers.HasFlag(ConsoleModifiers.Control):
-                        if (buffer.Length == 0)
+                        if (buffer.Length == 0 || inputPolicy == TerminalInputPolicy.ConfigurationPrompt)
                         {
                             EndInput();
                             return null;
@@ -241,6 +307,7 @@ internal sealed class LineEditor
 
                         break;
                     case ConsoleKey.C when key.Modifiers.HasFlag(ConsoleModifiers.Control):
+                        if (inputPolicy == TerminalInputPolicy.ConfigurationPrompt) throw new ConfigurationPromptCancelledException();
                         if (!acceptPaste) { EndInput(); return null; }
                         ClearInterruptedDraft(prompt, visiblePrompt);
                         break;
@@ -376,8 +443,9 @@ internal sealed class LineEditor
         _pointerSelection.Expire(_lastLayout, Environment.TickCount64);
         if (_pointerSelection.IsDragging && _dragRevision != TerminalMouse.Revision) _pointerSelection.Cancel();
         if (_canPointComposer.Invoke() != true || _historyTextSelection?.Invoke() == true) _pointerSelection.Cancel();
-        var mode = _lastLayout is null || _historyTextSelection?.Invoke() == true ? TerminalMouseMode.Off
-            : _pointerSelection.IsDragging ? TerminalMouseMode.Drag : TerminalMouseMode.Normal;
+        var mode = _lastLayout is null ? TerminalMouseMode.Off
+            : _historyTextSelection?.Invoke() == true ? TerminalMouseMode.NativeSelection
+            : _pointerSelection.IsDragging || _historyView?.DraggingHistory == true ? TerminalMouseMode.Drag : TerminalMouseMode.Normal;
         TerminalMouse.SetMode(mode);
         if (_pointerSelection.IsDragging) _dragRevision = TerminalMouse.Revision;
     }
@@ -476,48 +544,66 @@ internal sealed class LineEditor
 
     private void Complete(string prompt, string visiblePrompt, StringBuilder buffer, ref int cursor)
     {
-        if (_draft.HasSelection) return;
-        _draft.SelectionAnchor = null;
-        var input = buffer.ToString();
-        var prefixLength = _lastLayout is null ? input.Length : CompletionPrefixLength(input);
-        if (_lastLayout is not null && (prefixLength == 0 || cursor > prefixLength)) return;
-        var matches = _completionProvider(_lastLayout is null ? input : input[..cursor]);
-        if (matches.Count == 0)
-        {
-            return;
-        }
+        if (!_acceptPaste || _draft.HasSelection || _draft.ContainsPaste
+            || _draft.SubmissionKind == InputSubmissionKind.AgentMessage) return;
+        var text = buffer.ToString();
+        if (!text.StartsWith('/')) return;
+        var matches = _completionProvider(text[..cursor]);
+        if (matches.Count == 0) return;
 
+        _completionEnd = cursor;
+        while (_completionEnd < text.Length && !char.IsWhiteSpace(text[_completionEnd])) _completionEnd++;
+        _selectedSuggestion = 0;
+        _suggestions = matches;
         if (matches.Count == 1)
         {
-            if (_lastLayout is null)
-                ReplaceBuffer(buffer, matches[0] + (input.Contains(' ') ? "" : " "), ref cursor);
-            else
-                ReplaceCompletion(buffer, ref cursor, prefixLength, matches[0]);
+            AcceptSuggestion(buffer, ref cursor);
             Render(prompt, visiblePrompt, buffer, cursor);
-            return;
         }
-
-        if (_lastLayout is not null)
-        {
-            _suggestions = string.Join("  ", matches);
-            Render(prompt, visiblePrompt, buffer, cursor);
-            return;
-        }
-        Console.WriteLine();
-        Console.WriteLine(string.Join("  ", matches.Select(Ansi.Accent)));
-        // Cursor is now 2 lines below the input — update tracking so the
-        // next Render moves back up past suggestions + old input line.
-        _lastCursorLine += 2;
-        _lastRenderLines += 2;
-        // Don't call Render — suggestions remain visible until next keystroke.
+        else ShowSuggestions(prompt, visiblePrompt, buffer, cursor);
     }
 
-    private static int CompletionPrefixLength(string text)
+    private void AcceptSuggestion(StringBuilder buffer, ref int cursor)
     {
-        if (!text.StartsWith('/')) return 0;
-        var index = 0;
-        while (index < text.Length && !char.IsWhiteSpace(text[index])) index++;
-        return index;
+        ReplaceCompletion(buffer, ref cursor, _completionEnd, _suggestions![_selectedSuggestion]);
+        _suggestions = null;
+        _clearSuggestions = true;
+    }
+
+    private void ShowSuggestions(string prompt, string visiblePrompt, StringBuilder buffer, int cursor)
+    {
+        if (_lastLayout is not null)
+        {
+            Render(prompt, visiblePrompt, buffer, cursor);
+            return;
+        }
+
+        // An inline terminal has no fixed hint row. Leave the active item
+        // visible in scrollback and redraw the command below it.
+        Console.WriteLine();
+        Console.WriteLine($"Completion {_selectedSuggestion + 1}/{_suggestions!.Count}: {_suggestions[_selectedSuggestion]} · arrows / Tab / Esc");
+        ResetRenderState();
+        Render(prompt, visiblePrompt, buffer, cursor);
+    }
+
+    private string SuggestionHint(ScreenLayout layout)
+    {
+        _suggestionHits.Clear();
+        var indent = layout.ComposerWidth >= 12 ? 2 : 0;
+        var available = Math.Max(0, layout.InputColumns - indent);
+        var output = new StringBuilder();
+        for (var i = _selectedSuggestion; i < _suggestions!.Count; i++)
+        {
+            var item = i == _selectedSuggestion ? $"[{_suggestions[i]}]" : _suggestions[i];
+            if (i == _selectedSuggestion) item = ConsoleTheme.Summarize(item, available);
+            var width = ConsoleTheme.CellWidth(item);
+            if (width == 0 || output.Length + width > available) break;
+            var start = layout.ComposerInnerLeft + indent + output.Length;
+            _suggestionHits.Add((start, start + width, i));
+            output.Append(item);
+            if (output.Length + 2 <= available) output.Append("  ");
+        }
+        return output.ToString();
     }
 
     internal static void ReplaceCompletion(StringBuilder buffer, ref int cursor, int prefixLength, string match)
@@ -567,11 +653,12 @@ internal sealed class LineEditor
             _lastLayout = layout;
             _draft.FirstVisibleRow = projection.FollowCursor(_draft.FirstVisibleRow, layout.InputRows);
             if (_suggestions is not null && layout.HintHeight > 0)
-                ConsoleTheme.WriteComposerHint(Console.Out, layout, _suggestions);
+                ConsoleTheme.WriteComposerHint(Console.Out, layout, SuggestionHint(layout));
             else if (_clearSuggestions && layout.HintHeight > 0)
-                ConsoleTheme.WriteComposerHint(Console.Out, layout, ConsoleTheme.ComposerHint(layout, _canGoBack?.Invoke() == true));
+                ConsoleTheme.WriteComposerHint(Console.Out, layout, _historyView?.CurrentHistoryHint
+                    ?? ConsoleTheme.ComposerHint(layout, _canGoBack?.Invoke() == true));
             _clearSuggestions = false;
-            projection.Write(Console.Out, layout, _draft.FirstVisibleRow, text.Length == 0,
+            projection.Write(Console.Out, layout, _draft.FirstVisibleRow, _acceptPaste && text.Length == 0,
                 _draft.SelectionStart, _draft.SelectionEnd);
             return;
         }

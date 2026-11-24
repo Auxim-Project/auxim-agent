@@ -27,7 +27,7 @@ public sealed class KittyKeyTests
     }
     [Theory]
     [InlineData("99;0u")][InlineData("99;+5u")][InlineData("99;257u")]
-    [InlineData("99;9u")][InlineData("99;5:3u")][InlineData("13;2;13u")]
+    [InlineData("100;9u")][InlineData("99;5:3u")][InlineData("13;2;13u")]
     [InlineData("?99u")][InlineData("999999999999999999u")]
     public void UnsupportedFieldsAreNeverKeys(string wire)
     {

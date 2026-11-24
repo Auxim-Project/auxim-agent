@@ -19,6 +19,7 @@ for mode in ('alternate','inline','legacy','no-color','narrow','dumb'):
  if mode in ('inline','dumb'):env['AUXIM_NO_ALT_SCREEN']='1'
  if mode=='no-color':env['NO_COLOR']='1'
  fixed=mode not in ('inline','dumb');supported=mode not in ('legacy','dumb');width=32 if mode=='narrow' else 80
+ embedded=fixed and width >= 48
  pid,m=pty.fork()
  if pid==0:os.chdir(repo);os.execvpe('dotnet',['dotnet',str(cli)],env)
  fcntl.ioctl(m,termios.TIOCSWINSZ,struct.pack('HHHH',24,width,0,0));data=bytearray();wire=b'';screen=False;flags={False:0,True:0};stacks={False:[],True:[]};exited=False
@@ -50,8 +51,7 @@ for mode in ('alternate','inline','legacy','no-color','narrow','dumb'):
  def command(text):at=len(data);send(text+'\r');return at
  def success(text,marker):
   at=command(text)
-  if fixed:wait('Press Enter to return',at);send('\r')
-  else:wait('Tool completed.',at)
+  wait('Tool completed.',at)
   assert marker.encode() in data[at:];alive()
  def approval():
   at=command('/tool run file.write path=/tmp/blocked content=harmless');wait('Allow',at);return at
@@ -67,24 +67,38 @@ for mode in ('alternate','inline','legacy','no-color','narrow','dumb'):
   end=time.monotonic()+5
   while not started.is_set() and time.monotonic()<end:
    drain()
-   if b'Decision' in data[at:]:send('\r')
+   if b'Allow once' in data[at:]:send('\r')
   assert started.is_set();assert not supported or flags[screen]==1
   for _ in range(4):send('\x1b[99;5u' if supported else '\x03')
   wait('Tool wait cancelled',at);alive();success('/tool run echo text=NEXT_TOOL_OK','NEXT_TOOL_OK')
   # Normal failure and thrown tool lookup exception don't exit the shell.
   at=command('/tool run definitely-missing-tool');wait('Tool failed:',at);alive()
   at=command('/tool run file.read path=/tmp/absent-audit-file');wait('Tool failed:',at);alive()
-  at=approval();send('3\r');wait('Feedback',at);send('audit denial\r');wait('Tool failed:',at);assert not (home/'tmp/blocked').exists()
-  for attack in ('\x1b[200~2\r\x1b[201~','\x1b[99999;5u\r','\x1b[<0;2;2M2\r'):
+  at=approval();send('3\r');wait('Feedback for the model',at);send('audit denial\r');wait('Tool failed:',at);assert not (home/'tmp/blocked').exists()
+  for attack in ('\x1b[200~2\r\x1b[201~','\x1b[99999;5u\r','\x1b[13u','\x1bOQ\r','\x1b[<65;2;2M2\r','\x1b[<0;2;2M2\r'):
    at=approval();send(attack);wait('Tool failed:',at);assert not (home/'tmp/blocked').exists() and not (home/'approvals.json').exists()
   # Legitimate Allow once still executes, and late cancellation cannot undo it.
   at=approval();send('\r')
   end=time.monotonic()+5
   while not (home/'tmp/blocked').exists() and time.monotonic()<end:drain()
   assert (home/'tmp/blocked').read_text()=='harmless'
-  if fixed:wait('Press Enter to return',at);send('\x03');send('\r')
-  else:wait('Tool completed.',at)
+  wait('Tool completed.',at)
   assert (home/'tmp/blocked').exists();success('/tool run echo text=AFTER_ALLOW','AFTER_ALLOW')
+  if mode=='narrow':
+   at=command('/tool run file.write path=/tmp/narrow content='+('x'*900)+'-NARROW_END')
+   wait('SAFETY REVIEW',at)
+   for _ in range(5):send('\x1b[6~')
+   wait('NARROW_END',at)
+   send('3\r');wait('Feedback for the model',at);send('narrow denial\r');wait('Tool failed:',at)
+   assert not (home/'tmp/narrow').exists()
+  if embedded:
+   at=command('/tool run file.write path=/tmp/remembered content=remembered');wait('Allow once',at)
+   send('2\r');wait('Tool completed.',at)
+   assert (home/'tmp/remembered').read_text()=='remembered'
+   assert json.loads((home/'approvals.json').read_text())['grants']
+   at=command('/tool run file.write path=/tmp/remembered content=reused');wait('Tool completed.',at)
+   assert b'SAFETY REVIEW' not in data[at:] and (home/'tmp/remembered').read_text()=='reused'
+
   assert session.read_bytes()==original and (home/'current_session').read_text()=='kept'
   send('/exit\r');_,status=os.waitpid(pid,0);exited=True;drain();assert os.waitstatus_to_exitcode(status)==0
   assert not stacks[False] and not stacks[True] and flags=={False:0,True:0}

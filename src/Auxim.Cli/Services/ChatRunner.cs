@@ -16,6 +16,14 @@ public sealed class ChatRunner
         _eventSink = eventSink;
     }
 
+    private readonly CliApprovalHandler _approval = new();
+
+    internal ChatRunner(IAuximRuntime runtime, IRuntimeEventSink eventSink, InteractiveView view)
+        : this(runtime, eventSink)
+    {
+        _approval = new CliApprovalHandler(view);
+    }
+
     public async Task<AuximChatResult> RunAsync(string prompt, CancellationToken cancellationToken = default)
     {
         var result = await _runtime.ChatAsync(
@@ -23,7 +31,7 @@ public sealed class ChatRunner
             new AuximRuntimeOptions
         {
             EventSink = _eventSink,
-            ApprovalHandler = new CliApprovalHandler(),
+            ApprovalHandler = _approval,
         },
             cancellationToken);
         return result;

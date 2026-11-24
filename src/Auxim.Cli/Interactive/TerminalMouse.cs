@@ -1,10 +1,12 @@
 namespace Auxim.Cli.Interactive;
 
-internal enum TerminalMouseMode { Off, Normal, Drag }
+internal enum TerminalMouseMode { Off, Normal, Drag, NativeSelection }
 
 internal static class TerminalMouse
 {
     private static readonly object Sync = new();
+    internal const string DisableReports = "\u001b[?9l\u001b[?1000l\u001b[?1002l\u001b[?1003l"
+        + "\u001b[?1005l\u001b[?1006l\u001b[?1007l\u001b[?1015l\u001b[?1016l";
     public static TerminalMouseMode Mode { get; private set; }
     public static long Revision { get; private set; }
 
@@ -13,7 +15,7 @@ internal static class TerminalMouse
         lock (Sync)
         {
             if (Ansi.ControlSequencesEnabled)
-                WriteAndFlush("\u001b[?1007l\u001b[?1006l\u001b[?1003l\u001b[?1002l\u001b[?1000l");
+                WriteAndFlush(DisableReports);
             Mode = TerminalMouseMode.Off;
             Revision++;
         }
@@ -21,18 +23,23 @@ internal static class TerminalMouse
 
     public static void SetMode(TerminalMouseMode mode)
     {
-        if (!Ansi.ControlSequencesEnabled || mode != TerminalMouseMode.Off && !TerminalInput.SupportsMouseReports)
+        if (!Ansi.ControlSequencesEnabled || (mode is TerminalMouseMode.Normal or TerminalMouseMode.Drag) && !TerminalInput.SupportsMouseReports)
             mode = TerminalMouseMode.Off;
         lock (Sync)
         {
             if (Mode == mode) return;
             if (Ansi.ControlSequencesEnabled)
             {
-                // Never use 1007: wheel and physical arrows must remain distinct.
-                WriteAndFlush("\u001b[?1007l\u001b[?1003l\u001b[?1002l\u001b[?1000l");
-                WriteAndFlush(mode == TerminalMouseMode.Off ? "\u001b[?1006l"
-                    : "\u001b[?1005l\u001b[?1015l\u001b[?1006h" + (mode == TerminalMouseMode.Drag ? "\u001b[?1002h" : "\u001b[?1000h"));
+                // Release reports before native selection. Never enable mode
+                // 1007, which converts wheel motion into indistinguishable keys.
+                WriteAndFlush(DisableReports + (mode switch
+                {
+                    TerminalMouseMode.Normal => "\u001b[?1006h\u001b[?1000h",
+                    TerminalMouseMode.Drag => "\u001b[?1006h\u001b[?1002h",
+                    _ => ""
+                }));
             }
+            TerminalInput.SetNativeMouseInput(mode);
             Mode = mode;
             Revision++;
         }
@@ -45,7 +52,7 @@ internal static class TerminalMouse
     {
         // A press is never resumed after another foreground owner: its release
         // might have been consumed there. Restore reports, never a held drag.
-        var restore = Mode == TerminalMouseMode.Off ? TerminalMouseMode.Off : TerminalMouseMode.Normal;
+        var restore = Mode == TerminalMouseMode.Drag ? TerminalMouseMode.Normal : Mode;
         SetMode(TerminalMouseMode.Off);
         return new Suspension(restore);
     }

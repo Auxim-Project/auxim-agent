@@ -101,7 +101,39 @@ internal static class TerminalTextLayout
 
     public static IReadOnlyList<string> WrapStyled(string text, int columns) => WrapCore(text, columns, true);
 
-    private static IReadOnlyList<string> WrapCore(string text, int columns, bool styled)
+    internal static IReadOnlyList<string> WrapTranscript(string text, int columns,
+        Action<int, int, int, int, int> span) => WrapCore(text, columns, true, span);
+
+    internal static string HighlightCells(string styled, int start, int end)
+    {
+        var output = new StringBuilder();
+        var column = 0;
+        var active = false;
+        for (var index = 0; index < styled.Length;)
+        {
+            var match = styled[index] == '\u001b' ? ControlSequence.Match(styled, index) : null;
+            if (match is { Success: true } && match.Index == index)
+            {
+                output.Append(match.Value);
+                if (active) output.Append("\u001b[7m");
+                index += match.Length;
+                continue;
+            }
+            var element = StringInfo.GetNextTextElement(styled, index);
+            var width = CellWidth(element);
+            var selected = column < end && column + width > start;
+            if (active != selected) output.Append(selected ? "\u001b[7m" : "\u001b[27m");
+            active = selected;
+            output.Append(element);
+            column += width;
+            index += element.Length;
+        }
+        if (active) output.Append("\u001b[27m");
+        return output.ToString();
+    }
+
+    private static IReadOnlyList<string> WrapCore(string text, int columns, bool styled,
+        Action<int, int, int, int, int>? span = null)
     {
         columns = Math.Max(1, columns);
         if (text.Length > 0 && char.IsHighSurrogate(text[^1])) text = text[..^1];
@@ -109,6 +141,7 @@ internal static class TerminalTextLayout
         var row = new StringBuilder();
         var used = 0;
         var style = "";
+        var plainIndex = 0;
         void BreakRow()
         {
             rows.Add(row + (style.Length == 0 ? "" : "\u001b[0m"));
@@ -132,7 +165,8 @@ internal static class TerminalTextLayout
                 continue;
             }
             var element = StringInfo.GetNextTextElement(text, index);
-            index += element.Length;
+            var length = element.Length;
+            index += length;
             if (element is "\r\n" or "\r" or "\n")
             {
                 BreakRow();
@@ -149,9 +183,11 @@ internal static class TerminalTextLayout
                         BreakRow();
                     }
 
+                    span?.Invoke(rows.Count, used, 1, plainIndex, plainIndex + 1);
                     row.Append(' '); used++;
                 }
 
+                plainIndex++;
                 continue;
             }
 
@@ -168,8 +204,10 @@ internal static class TerminalTextLayout
                 BreakRow();
             }
 
+            span?.Invoke(rows.Count, used, width, plainIndex, plainIndex + length);
             row.Append(element);
             used += width;
+            plainIndex += length;
         }
 
         rows.Add(row + (style.Length == 0 ? "" : "\u001b[0m"));

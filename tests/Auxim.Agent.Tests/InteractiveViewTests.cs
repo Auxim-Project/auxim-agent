@@ -11,11 +11,11 @@ public sealed class InteractiveViewTests
     {
         var output = await RunCliAsync([
             "first turn", "second turn", "/history", "/show 1",
-            "/resume", "1", "/history", "/jump 2", "/tail 1", "/exit",
+            "/session", "1", "/history", "/jump 2", "/tail 1", "/exit",
         ]);
 
         Assert.Equal(1, Count(output, "AUXIM / New Chat"));
-        Assert.Contains("Resume", output);
+        Assert.Contains("Sessions", output);
         Assert.Equal(2, Count(output, "Conversation History (2 turns)"));
         Assert.Contains("Turn 1", output);
         Assert.Equal(2, Count(output, "History from turn 2"));
@@ -52,7 +52,7 @@ public sealed class InteractiveViewTests
         Assert.Contains("Auxim Doctor", output);
         Assert.Contains("Provider:", output);
         Assert.Contains("Usage:", output);
-        Assert.Contains("stderr: Usage: auxim session use", output);
+        Assert.Contains("stderr: Usage: /session [clear|help]", output);
         Assert.Contains("Failed", output);
         Assert.Contains("exit 1", output);
         Assert.Contains("Conversation History (1 turn)", output);

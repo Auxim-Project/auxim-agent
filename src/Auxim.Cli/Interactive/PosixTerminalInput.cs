@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 namespace Auxim.Cli.Interactive;
 
 // One synchronous stdin owner. No Console reader may run while this backend is active.
-internal sealed class PosixTerminalInput : IDisposable
+internal sealed class PosixTerminalInput : ITerminalInputBackend, IDisposable
 {
     private const int Interrupted = 4;
     private readonly byte[] _original = new byte[512]; // Opaque native termios, including platform padding.
@@ -44,7 +44,7 @@ internal sealed class PosixTerminalInput : IDisposable
         // Preserve output processing and signal delivery (not cfmakeraw's default).
         var size = OperatingSystem.IsMacOS() ? 8 : 4;
         Array.Copy(_original, size, _raw, size, size);
-        if (size == 8)
+        if (OperatingSystem.IsMacOS())
             BinaryPrimitives.WriteUInt64LittleEndian(_raw.AsSpan(24),
                 BinaryPrimitives.ReadUInt64LittleEndian(_raw.AsSpan(24))
                 | (BinaryPrimitives.ReadUInt64LittleEndian(_original.AsSpan(24)) & 0x80UL));
@@ -53,6 +53,25 @@ internal sealed class PosixTerminalInput : IDisposable
                 BinaryPrimitives.ReadUInt32LittleEndian(_raw.AsSpan(12))
                 | (BinaryPrimitives.ReadUInt32LittleEndian(_original.AsSpan(12)) & 1U));
         Activate();
+    }
+
+    public void SetCtrlCInput(bool enabled)
+    {
+        var darwin = OperatingSystem.IsMacOS();
+        var index = darwin ? 32 + 8 : 17; // c_cc[VINTR]: Darwin index 8, Linux index 0.
+        var interrupt = _original[index];
+        // Bypass tty translation of keyboard ETX only. Leave ISIG and any
+        // user-configured non-ETX interrupt character intact. A process-directed
+        // SIGINT still reaches the ordinary cancellation handler.
+        var next = enabled && interrupt == 3 ? (darwin ? (byte)0xff : (byte)0) : interrupt;
+        var previous = _raw[index];
+        if (previous == next) return;
+        _raw[index] = next;
+        if (_active && TcSetAttr(0, 0, _raw) != 0)
+        {
+            _raw[index] = previous;
+            throw new IOException("Cannot change terminal interrupt character.");
+        }
     }
 
     public static PosixTerminalInput? Create()
@@ -98,18 +117,6 @@ internal sealed class PosixTerminalInput : IDisposable
         return true;
     }
 
-    // Drop queued decisions at ownership boundaries, but never reset partial framing.
-    public bool DiscardPending()
-    {
-        Decoder.DiscardEvents();
-        for (var i = 0; i < 16; i++)
-        {
-            if (!ReadAvailable()) return true;
-            Decoder.DiscardEvents();
-        }
-        return false;
-    }
-
     public void Suspend()
     {
         try { _keyboard?.Restore(); SetPasteMode(false); }
@@ -120,6 +127,7 @@ internal sealed class PosixTerminalInput : IDisposable
                 if (TcSetAttr(0, 0, _original) != 0) throw new IOException("Cannot restore terminal input settings.");
                 _active = false;
             }
+            SetCtrlCInput(false);
         }
     }
     public void Dispose() => Suspend();

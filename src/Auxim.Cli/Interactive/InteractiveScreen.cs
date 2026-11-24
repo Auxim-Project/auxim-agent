@@ -111,7 +111,7 @@ internal sealed class InteractiveScreen : IDisposable
             return;
         }
 
-        WriteAndFlush("\u001b[?1007l\u001b[?1006l\u001b[?1003l\u001b[?1002l\u001b[?1000l\u001b[?25h\u001b[?1049l");
+        WriteAndFlush(TerminalMouse.DisableReports + "\u001b[?25h\u001b[?1049l");
         IsAlternateScreenActive = false;
     }
 

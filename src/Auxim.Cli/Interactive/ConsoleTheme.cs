@@ -49,7 +49,7 @@ internal static class ConsoleTheme
     public static string CenterLine(string line, ScreenLayout layout) =>
         new string(' ', Math.Max(0, (layout.Columns - CellWidth(line)) / 2)) + line;
 
-    public static string RunningHint => "Working   Ctrl+C cancel";
+    public static string RunningHint => "Working   Ctrl+C cancel   Wheel History";
     public static string StatusHint(string text) => text.StartsWith("Error:", StringComparison.Ordinal) ? Ansi.Error(text)
         : text.StartsWith("Cancelled", StringComparison.Ordinal) ? Ansi.Warning(text) : Ansi.Muted(text);
 

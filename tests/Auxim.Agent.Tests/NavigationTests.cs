@@ -111,7 +111,7 @@ public sealed class NavigationTests : IDisposable
         Assert.Contains("Agent / Session", text);
         Assert.Contains("Recent activity", text);
         Assert.Contains("Quick actions", text);
-        Assert.Contains("/new", text); Assert.Contains("/resume", text); Assert.Contains("/history", text);
+        Assert.Contains("/new", text); Assert.Contains("/session", text); Assert.Contains("/history", text);
         Assert.Contains("No activity in this CLI session.", text);
         Assert.DoesNotContain("phantom", text);
         _view.ScrollTranscript(1, () => throw new Exception("Main downward scroll must not redraw"));
@@ -181,6 +181,46 @@ public sealed class NavigationTests : IDisposable
         _view.PrepareConversation();
         Assert.Equal(session.Id, _store.GetCurrentSessionId());
         Assert.Single(_runtime.ListSessions());
+    }
+
+    [Fact]
+    public void SessionPreviewPreservesFilterAndActiveSessionAndCanReturnFromAnEmptySession()
+    {
+        var other = _store.NewSession("Empty 中文");
+        var active = _store.NewSession("Active");
+        _store.AppendTurn(active, "question", "answer");
+        _view.Initialize();
+
+        Assert.True(_view.OpenResume());
+        _view.SetResumeQuery("中文");
+        _view.OpenSessionPreview();
+        Assert.Equal(InteractivePage.SessionPreview, _view.Page);
+        Assert.Equal(active.Id, _store.GetCurrentSessionId());
+        Assert.Empty(_runtime.GetSession(other.Id)!.Messages);
+
+        _view.NavigateBack();
+        Assert.Equal(InteractivePage.Resume, _view.Page);
+        Assert.Equal(active.Id, _store.GetCurrentSessionId());
+        Assert.True(_view.ResumeSession());
+        Assert.Equal(other.Id, _store.GetCurrentSessionId());
+    }
+
+    [Fact]
+    public void SessionPreviewReadFailureLeavesTheActiveSessionUntouched()
+    {
+        var unreadable = _store.NewSession("Unreadable");
+        var active = _store.NewSession("Active");
+        _view.Initialize();
+        Assert.True(_view.OpenResume());
+        _view.SetResumeQuery("Unreadable");
+        File.WriteAllText(Path.Combine(_home, "sessions", unreadable.Id + ".json"), "{invalid");
+
+        _view.OpenSessionPreview();
+        Assert.Equal(InteractivePage.SessionPreview, _view.Page);
+        Assert.False(_view.ResumeSession());
+        Assert.Equal(active.Id, _store.GetCurrentSessionId());
+        _view.NavigateBack();
+        Assert.Equal(InteractivePage.Resume, _view.Page);
     }
 
     [Fact]

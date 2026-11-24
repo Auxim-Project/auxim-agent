@@ -29,7 +29,10 @@ internal static class InteractiveShell
                 () => _view.CanPointComposer,
                 () => _view.HistoryTextSelection,
                 _view.ToggleHistoryTextSelection,
-                history.KindAt);
+                history.KindAt,
+                _view.QuickActionAt,
+                _view.ToggleCommandResultExpansion,
+                _view);
             _view.Initialize();
 
             while (true)
@@ -84,6 +87,18 @@ internal static class InteractiveShell
                             exitCode = await RunForegroundAsync(() => RunSlashCommandAsync(input));
                         else exitCode = await RunSlashCommandAsync(input);
                     }
+                    catch (ConfigurationPromptCancelledException)
+                    {
+                        TerminalInput.DiscardConfigurationInput();
+                        _view.ShowMain();
+                        _view.PrintStatus("Configuration cancelled.");
+                    }
+                    catch (EndOfStreamException exception) when (presentation == CommandPresentation.Foreground
+                        && parts[0].ToLowerInvariant() is "model" or "auth")
+                    {
+                        _view.ShowMain();
+                        _view.PrintStatus(exception.Message);
+                    }
                     catch (Exception exception)
                     {
                         _view.ShowCommandResult(parts.FirstOrDefault() ?? "command",
@@ -110,11 +125,12 @@ internal static class InteractiveShell
                     _view.PrintTurnHeader("assistant", $"thinking  {started:HH:mm:ss}");
                     var runner = new ChatRunner(
                         _runtime,
-                        new DelegateRuntimeEventSink(preview.PublishAsync));
-                    var result = await interrupts.AwaitTurnAsync(runner.RunAsync(input, turn.Token), _view.MarkCancelling);
+                        new DelegateRuntimeEventSink(preview.PublishAsync), _view);
+                    var result = await interrupts.AwaitTurnAsync(runner.RunAsync(input, turn.Token), _view.MarkCancelling,
+                        _view.UsesFixedLayout ? preview.NavigateAsync : null);
                     turn.Token.ThrowIfCancellationRequested();
                     await preview.FinishAsync();
-                    _view.EndRun();
+                    _view.EndRun(response: result.FinalResponse);
                     _view.AppendAssistantResponse(result.FinalResponse);
                     _view.PrintTurnFooter(started, preview.ToolEventCount);
                 }
@@ -135,6 +151,7 @@ internal static class InteractiveShell
                 catch (Exception exception)
                 {
                     await preview.FinishAsync("failed");
+                    _view.RetainIncompletePreview(preview.IncompleteLines);
                     _view.EndRun($"Error: {exception.Message}");
                     if (!_view.UsesFixedLayout)
                     {
@@ -160,8 +177,7 @@ internal static class InteractiveShell
     private static void ApplySessionTransition(IReadOnlyList<string> parts, int code)
     {
         if (code != 0 || parts.FirstOrDefault()?.ToLowerInvariant() != "session") return;
-        if (parts.Skip(1).FirstOrDefault() is "use" or "new") _view.ShowMain();
-        else if (parts.Skip(1).FirstOrDefault() == "clear") _view.ShowNewChat();
+        if (parts.Skip(1).FirstOrDefault() == "clear") _view.ShowNewChat();
     }
 
     private static async Task<int> RunDirectToolAsync(IReadOnlyList<string> args, InteractiveInterrupt interrupts)
@@ -172,6 +188,19 @@ internal static class InteractiveShell
         try
         {
             _view.ShowMain();
+            if (_view.UsesFixedLayout)
+            {
+                string output = "";
+                _view.PrintStatus("Running tool   Ctrl+C cancel");
+                var result = await interrupts.AwaitTurnAsync(CommandHandlers.HandleToolWithCancellation(
+                    args, _runtime, turn.Token, new CliApprovalHandler(_view), value => output = value));
+                var status = turn.IsCancellationRequested
+                    ? "Tool completed after a cancellation request. Effects were not rolled back."
+                    : "Tool completed.";
+                _view.ShowCommandResult("tool run", new(result, [status, .. output.ReplaceLineEndings("\n").Split('\n')]));
+                return result;
+            }
+
             var code = await RunForegroundAsync(async () =>
             {
                 ConsoleTheme.Hint("Running tool. Ctrl+C requests cancellation; completed effects are not undone.");
@@ -232,6 +261,23 @@ internal static class InteractiveShell
 
         var command = parts[0].ToLowerInvariant();
         var args = parts.Skip(1).ToArray();
+        if (args is ["help" or "--help" or "-h"]
+            && InteractiveCommandCatalog.Find("/" + command) is { Subcommands: { } subcommands } help)
+        {
+            Console.WriteLine($"/{command} — {help.Description}");
+            if (command == "session")
+            {
+                Console.WriteLine("  /session  Filter, preview and select a saved session");
+                Console.WriteLine("  /session clear  Clear the active selection; keep saved sessions");
+                Console.WriteLine("  /new  Start a new chat");
+            }
+            else
+            {
+                foreach (var subcommand in subcommands)
+                    Console.WriteLine($"  /{command} {subcommand}");
+            }
+            return 0;
+        }
         switch (command)
         {
             case "exit":
@@ -262,10 +308,6 @@ internal static class InteractiveShell
             case "tail":
                 _view.TailTurns(args);
                 return 0;
-            case "resume":
-                if (args.Length > 0) return _view.ResumeSession(args[0]) ? 0 : 1;
-                BrowseSessions();
-                return 0;
             case "status":
                 _view.PrintRuntimePanel();
                 return 0;
@@ -282,15 +324,14 @@ internal static class InteractiveShell
             case "config":
                 return CommandHandlers.HandleConfig(args, _runtime);
             case "session":
-                if (args.FirstOrDefault() == "list" || args.FirstOrDefault() == "use" && args.Length == 1)
+                if (args.Length == 0)
                 {
                     BrowseSessions();
                     return 0;
                 }
-                return CommandHandlers.HandleSession(args, _runtime);
-            case "sessions":
-                BrowseSessions();
-                return 0;
+                if (args is ["clear"]) return CommandHandlers.HandleSession(args, _runtime);
+                Console.Error.WriteLine("Usage: /session [clear|help]. Use /new to start a new chat.");
+                return 1;
             case "tools":
                 return await CommandHandlers.HandleTool(["list"], _runtime);
             case "tool":
@@ -326,26 +367,73 @@ internal static class InteractiveShell
             else if (!_view.ResumeNumberOrId(selection.Trim())) _view.NavigateBack();
             return;
         }
-        while (_view.Page == InteractivePage.Resume)
+        using var paste = TerminalInput.BeginPasteInput();
+        while (_view.Page is InteractivePage.Resume or InteractivePage.SessionPreview)
         {
             // Same serial input ownership as the editor and approval prompt.
             if (!TerminalInput.KeyAvailable)
             {
                 _view.PrepareInputLayout();
+                _view.TickHistorySelection();
                 Thread.Sleep(25);
                 continue;
             }
-            var input = TerminalInput.Read(TerminalInputPolicy.LineEditor);
-            if (input.Kind == TerminalInputEventKind.EndOfInput) { _view.NavigateBack(); return; }
+            var input = TerminalInput.Read(_view.CanInteractWithHistory ? TerminalInputPolicy.HistoryEditor : TerminalInputPolicy.LineEditor);
+            if (input.Kind == TerminalInputEventKind.EndOfInput) { _view.ShowMain(); return; }
+            if (_view.Page == InteractivePage.SessionPreview)
+            {
+                if (_view.HandleHistoryInput(input)) continue;
+                if (input.Kind == TerminalInputEventKind.MouseWheel)
+                    _view.ScrollWheel(input.ScrollDelta * 3, static () => { });
+                if (input.Kind != TerminalInputEventKind.Key) continue;
+                if (input.Key is { Key: ConsoleKey.R, Modifiers: ConsoleModifiers.Control })
+                    _view.ToggleHistoryTextSelection();
+                if (input.Key.Modifiers != 0) continue;
+                switch (input.Key.Key)
+                {
+                    case ConsoleKey.LeftArrow:
+                    case ConsoleKey.Escape: _view.NavigateBack(); break;
+                    case ConsoleKey.Enter: _view.ResumeSession(); break;
+                    case ConsoleKey.F2: _view.ToggleHistoryTextSelection(); break;
+                    case ConsoleKey.UpArrow: _view.ScrollSessionPreview(-1); break;
+                    case ConsoleKey.DownArrow: _view.ScrollSessionPreview(1); break;
+                    case ConsoleKey.PageUp: _view.ScrollSessionPreview(-1, byPage: true); break;
+                    case ConsoleKey.PageDown: _view.ScrollSessionPreview(1, byPage: true); break;
+                }
+                continue;
+            }
+            if (input.Kind == TerminalInputEventKind.Pointer && input.Pointer is { } pointer)
+            {
+                _view.SelectResumeAt(pointer);
+                continue;
+            }
+            if (input.Kind == TerminalInputEventKind.MouseWheel)
+            {
+                _view.MoveResumeSelection(input.ScrollDelta);
+                continue;
+            }
+            if (input.Kind == TerminalInputEventKind.Paste)
+            {
+                if (input.Text is { } text) _view.AppendResumeQuery(text);
+                continue;
+            }
             if (input.Kind != TerminalInputEventKind.Key) continue;
             switch (input.Key.Key)
             {
+                case ConsoleKey.Backspace: _view.DeleteResumeQueryElement(); break;
+                case ConsoleKey.U when input.Key.Modifiers == ConsoleModifiers.Control: _view.SetResumeQuery(""); break;
                 case ConsoleKey.UpArrow: _view.MoveResumeSelection(-1); break;
                 case ConsoleKey.DownArrow: _view.MoveResumeSelection(1); break;
-                case ConsoleKey.Enter: _view.ResumeSession(); break;
+                case ConsoleKey.RightArrow when input.Key.Modifiers == 0: _view.OpenSessionPreview(); break;
+                case ConsoleKey.Enter when input.Key.Modifiers == 0: _view.ResumeSession(); break;
                 case ConsoleKey.Escape:
                     _view.NavigateBack();
                     TerminalInput.DiscardQueuedNavigation();
+                    break;
+                default:
+                    if (!char.IsControl(input.Key.KeyChar)
+                        && (input.Key.Modifiers & (ConsoleModifiers.Alt | ConsoleModifiers.Control)) == 0)
+                        _view.AppendResumeQuery(input.Key.KeyChar.ToString());
                     break;
             }
         }
@@ -354,6 +442,7 @@ internal static class InteractiveShell
     private static InputSubmission? ReadUserInput(LineEditor editor)
     {
         _view.ApplyMousePolicy();
+        _view.SyncHistoryCopyControl();
         string? input;
         try
         {
@@ -364,9 +453,11 @@ internal static class InteractiveShell
                 scrollNavigation: true,
                 navigateBack: _view.NavigateBack,
                 acceptPaste: true);
+            if (input is not null) _view.CloseCommandResult();
         }
         finally
         {
+            TerminalInput.SetHistoryCopyControl(false);
             // Do not leave mouse reports or navigation keys queued while a model,
             // tool, approval prompt, or child process owns the foreground.
             InteractiveScreen.SetHistoryScrollActive(active: false);
@@ -376,8 +467,6 @@ internal static class InteractiveShell
         {
             return null;
         }
-
-        _view.CloseCommandResult();
 
         var submission = editor.Submission ?? throw new InvalidOperationException("Missing input submission type.");
         if (editor.SubmittedPaste || (submission.Kind != InputSubmissionKind.CliCommand || input.Trim() != "/paste") && !input.EndsWith('\\')) return submission;

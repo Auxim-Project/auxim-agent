@@ -40,6 +40,13 @@ for case in ('supported','timeout','malformed','late','activation-mismatch','int
   else:assert flags==8 and not stack;assert b'active flags=0' in data
   if case=='late':
    at=len(data);os.write(m,b'\x1b[?1u');drain(.3);assert len(data)==at,'late response leaked';assert not stack
+  if case=='supported':
+   os.write(m,b'\x03\x1b[99;5u\x1b[99;9u')
+   wait(b'legacy/native Ctrl+C -> copy key delivered')
+   wait(b'CSI-u Ctrl+C -> copy key delivered')
+   wait(b'CSI-u Super+C -> copy key delivered')
+   os.kill(p.pid,signal.SIGINT)
+   wait(b'Signal / console interrupt -> idle cancellation')
   if case=='signal-exit':os.kill(p.pid,signal.SIGTERM)
   else:
    # Payloads must never appear in diagnostic output.

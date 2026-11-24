@@ -21,6 +21,7 @@ internal sealed class TerminalInputDecoder
     private bool _stringBel;
     private bool _invalid;
     private bool _discardSequenceScroll;
+    private bool _discardSequenceWheel;
     private int _legacyMouseBytes;
     private static ReadOnlySpan<byte> PasteEnd => "\u001b[201~"u8;
     public long KeyboardReplyRevision { get; private set; }
@@ -28,6 +29,7 @@ internal sealed class TerminalInputDecoder
     public bool HasPartialSequence => _state != State.Text || _utf8Count != 0;
     public bool HasEvents => _events.Count != 0;
     public bool IsBareEscape => _state == State.Escape;
+    internal void Enqueue(TerminalInputEvent value) => _events.Enqueue(value);
     public TerminalInputEvent Take() => _events.Dequeue();
     public void DiscardEvents() { _events.Clear(); DiscardPastePayload(); }
 
@@ -53,6 +55,17 @@ internal sealed class TerminalInputDecoder
         if (_state is State.Escape or State.Csi or State.Ss3) _discardSequenceScroll = true;
     }
 
+    public void DiscardQueuedWheel()
+    {
+        var count = _events.Count;
+        for (var i = 0; i < count; i++)
+        {
+            var value = _events.Dequeue();
+            if (value.Kind != TerminalInputEventKind.MouseWheel) _events.Enqueue(value);
+        }
+        if (_state is State.Escape or State.Csi) _discardSequenceWheel = true;
+    }
+
     private static bool IsScroll(ConsoleKey key) => key is ConsoleKey.UpArrow or ConsoleKey.DownArrow
         or ConsoleKey.PageUp or ConsoleKey.PageDown;
 
@@ -75,7 +88,7 @@ internal sealed class TerminalInputDecoder
     {
         if (!IsBareEscape || HasEvents) return;
         _state = State.Text;
-        _discardSequenceScroll = false;
+        _discardSequenceScroll = _discardSequenceWheel = false;
         Key(ConsoleKey.Escape, '\u001b');
     }
 
@@ -112,14 +125,14 @@ internal sealed class TerminalInputDecoder
         if (_state == State.String)
         {
             if (value == 0x9c || value == 7 && _stringBel || (_stringEscape && value == (byte)'\\'))
-            { _state = State.Text; _discardSequenceScroll = false; }
+            { _state = State.Text; _discardSequenceScroll = _discardSequenceWheel = false; }
             _stringEscape = value == 0x1b;
             return;
         }
         if (_state == State.EscIntermediate)
         {
             if (value == 0x1b) { Control(); _state = State.Escape; }
-            else if (value is >= 0x30 and <= 0x7e) { Control(); _state = State.Text; _discardSequenceScroll = false; }
+            else if (value is >= 0x30 and <= 0x7e) { Control(); _state = State.Text; _discardSequenceScroll = _discardSequenceWheel = false; }
             return;
         }
         if (_state is State.Csi or State.Ss3)
@@ -127,6 +140,7 @@ internal sealed class TerminalInputDecoder
             if (value == 0x1b)
             {
                 Control(); _state = State.Escape; _sequence.Clear(); _invalid = false;
+                _discardSequenceWheel = false; // New report, not the abandoned fragment.
                 return;
             }
             if (value is >= 0x40 and <= 0x7e)
@@ -145,7 +159,7 @@ internal sealed class TerminalInputDecoder
                     _state = State.LegacyMouse; _legacyMouseBytes = 3; Control();
                 }
                 else if (_invalid || !DecodeKey(sequence, ss3)) Control();
-                _sequence.Clear(); _invalid = false; _discardSequenceScroll = false;
+                _sequence.Clear(); _invalid = false; _discardSequenceScroll = _discardSequenceWheel = false;
             }
             else if (value is >= 0x20 and <= 0x3f && _sequence.Length < 64)
                 _sequence.Append((char)value);
@@ -167,6 +181,7 @@ internal sealed class TerminalInputDecoder
                 case (byte)']': case (byte)'P': case (byte)'X': case (byte)'^': case (byte)'_':
                     _state = State.String; _stringBel = value == (byte)']'; _stringEscape = false; Control(); return;
                 case 0x1b:
+                    _discardSequenceWheel = false;
                     _events.Enqueue(new(TerminalInputEventKind.EscapeBoundary, default));
                     return;
                 default:
@@ -174,7 +189,7 @@ internal sealed class TerminalInputDecoder
                     _state = State.Text;
                     if (value < 0x80) DecodeAscii(value, ConsoleModifiers.Alt);
                     else Control();
-                    _discardSequenceScroll = false;
+                    _discardSequenceScroll = _discardSequenceWheel = false;
                     return;
             }
         }
@@ -246,7 +261,7 @@ internal sealed class TerminalInputDecoder
                 | ((button & 16) != 0 ? ConsoleModifiers.Control : 0);
             if (code is 64 or 65 && sequence[^1] == 'M')
             {
-                if (!_discardSequenceScroll)
+                if (!_discardSequenceScroll && !_discardSequenceWheel)
                     _events.Enqueue(new(TerminalInputEventKind.MouseWheel, default, ScrollDelta: (code & 1) == 0 ? -1 : 1,
                         Pointer: new(code, x, y, pointerModifiers, PointerPhase.Press)));
                 return true;
@@ -301,9 +316,11 @@ internal sealed class TerminalInputDecoder
         if ((parameters is "" or "1") && final is 'A' or 'B' or 'C' or 'D' or 'H' or 'F')
             key = final switch { 'A' => ConsoleKey.UpArrow, 'B' => ConsoleKey.DownArrow,
                 'C' => ConsoleKey.RightArrow, 'D' => ConsoleKey.LeftArrow, 'H' => ConsoleKey.Home, _ => ConsoleKey.End };
+        else if ((parameters is "" or "1") && (final == 'Q' || ss3 && final == 'R'))
+            key = final == 'Q' ? ConsoleKey.F2 : ConsoleKey.F3;
         else if (!ss3 && final == '~')
             key = parameters switch { "1" or "7" => ConsoleKey.Home, "4" or "8" => ConsoleKey.End,
-                "2" => ConsoleKey.Insert, "3" => ConsoleKey.Delete, "5" => ConsoleKey.PageUp, "6" => ConsoleKey.PageDown, _ => 0 };
+                "2" => ConsoleKey.Insert, "3" => ConsoleKey.Delete, "5" => ConsoleKey.PageUp, "6" => ConsoleKey.PageDown, "12" => ConsoleKey.F2, "13" => ConsoleKey.F3, _ => 0 };
         else if (!ss3 && sequence == "Z") { key = ConsoleKey.Tab; modifiers = ConsoleModifiers.Shift; }
         else return false;
         if (key == 0) return false;
@@ -320,9 +337,10 @@ internal sealed class TerminalInputDecoder
         if (fields.Length == 2 && !Decimal(fields[1], out encoded)) return false;
         if (encoded is < 1 or > 256) return false;
         var bits = encoded - 1;
-        // ConsoleKeyInfo has no super/hyper/meta representation. Never silently
-        // turn these into an unmodified shortcut. Lock bits are kept as metadata.
-        if ((bits & 56) != 0) return false;
+        // Super+C is routed only by the History editor. Never turn other
+        // super/hyper/meta keys into unmodified shortcuts.
+        var superCopy = code == 99 && (bits & 63) == 8;
+        if ((bits & 56) != 0 && !superCopy) return false;
         var modifiers = ((bits & 1) != 0 ? ConsoleModifiers.Shift : 0)
             | ((bits & 2) != 0 ? ConsoleModifiers.Alt : 0)
             | ((bits & 4) != 0 ? ConsoleModifiers.Control : 0);
@@ -335,7 +353,7 @@ internal sealed class TerminalInputDecoder
             case 9: key = ConsoleKey.Tab; character = '\t'; break;
             case 127: key = ConsoleKey.Backspace; character = '\u007f'; break;
             default:
-                if (code is >= 97 and <= 122 && (bits & 6) != 0)
+                if (code is >= 97 and <= 122 && ((bits & 6) != 0 || superCopy))
                 {
                     key = ConsoleKey.A + code - 97;
                     character = (bits & 4) != 0 ? (char)(code - 96) : '\0';

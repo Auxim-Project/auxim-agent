@@ -10,14 +10,17 @@ internal static class MarkdownConsoleRenderer
         }
     }
 
-    public static IReadOnlyList<string> RenderToLines(string markdown)
+    public static IReadOnlyList<string> RenderToLines(string markdown) =>
+        RenderTranscript(markdown).Select(line => line.Display).ToArray();
+
+    internal static IReadOnlyList<HistoryLine> RenderTranscript(string markdown)
     {
         // Model echoes and saved messages may contain literal pasted controls.
         // Keep them in the message, but never execute them on the terminal.
         markdown = TerminalTextLayout.Plain(markdown);
         var inCodeBlock = false;
         var codeLanguage = "";
-        var lines = new List<string>();
+        var lines = new List<HistoryLine>();
 
         foreach (var rawLine in SplitLines(markdown))
         {
@@ -26,15 +29,15 @@ internal static class MarkdownConsoleRenderer
             {
                 inCodeBlock = !inCodeBlock;
                 codeLanguage = inCodeBlock ? line[3..].Trim() : "";
-                lines.Add(inCodeBlock
+                lines.Add(new(inCodeBlock
                     ? $"{ConsoleTheme.Badge("code")} {Ansi.Muted(codeLanguage.Length == 0 ? "text" : codeLanguage)}"
-                    : ConsoleTheme.Badge("end"));
+                    : ConsoleTheme.Badge("end"), Decoration: true));
                 continue;
             }
 
             if (inCodeBlock)
             {
-                lines.Add($"  {line}");
+                lines.Add(new($"  {rawLine}", Prefix: 2));
                 continue;
             }
 
@@ -44,11 +47,11 @@ internal static class MarkdownConsoleRenderer
         return lines;
     }
 
-    private static IReadOnlyList<string> RenderLine(string line)
+    private static IReadOnlyList<HistoryLine> RenderLine(string line)
     {
         if (line.Length == 0)
         {
-            return [""];
+            return [new("")];
         }
 
         var trimmed = line.TrimStart();
@@ -56,7 +59,7 @@ internal static class MarkdownConsoleRenderer
 
         if (trimmed is "---" or "***" or "___")
         {
-            return [ConsoleTheme.RuleText()];
+            return [new(ConsoleTheme.RuleText(), Decoration: true)];
         }
 
         if (trimmed.StartsWith("#", StringComparison.Ordinal))
@@ -66,26 +69,26 @@ internal static class MarkdownConsoleRenderer
 
         if (trimmed.StartsWith("> ", StringComparison.Ordinal))
         {
-            return [$"{Ansi.Muted("|")} {RenderInline(trimmed[2..])}"];
+            return [new($"{Ansi.Muted("|")} {RenderInline(trimmed[2..])}", Prefix: 2)];
         }
 
         if (trimmed.StartsWith("- ", StringComparison.Ordinal)
             || trimmed.StartsWith("* ", StringComparison.Ordinal)
             || trimmed.StartsWith("+ ", StringComparison.Ordinal))
         {
-            return [$"{new string(' ', indent)}{Ansi.Accent("-")} {RenderInline(trimmed[2..])}"];
+            return [new($"{new string(' ', indent)}{Ansi.Accent("-")} {RenderInline(trimmed[2..])}")];
         }
 
         var ordered = TryParseOrderedList(trimmed);
         if (ordered is not null)
         {
-            return [$"{new string(' ', indent)}{Ansi.Accent(ordered.Value.Marker)} {RenderInline(ordered.Value.Text)}"];
+            return [new($"{new string(' ', indent)}{Ansi.Accent(ordered.Value.Marker)} {RenderInline(ordered.Value.Text)}")];
         }
 
-        return [RenderInline(line)];
+        return [new(RenderInline(line))];
     }
 
-    private static IReadOnlyList<string> RenderHeading(string line)
+    private static IReadOnlyList<HistoryLine> RenderHeading(string line)
     {
         var level = 0;
         while (level < line.Length && line[level] == '#')
@@ -96,15 +99,15 @@ internal static class MarkdownConsoleRenderer
         var text = line[level..].Trim();
         if (text.Length == 0)
         {
-            return [line];
+            return [new(line)];
         }
 
         if (level <= 2)
         {
-            return ["", Ansi.Bold(text)];
+            return [new("", Decoration: true), new(Ansi.Bold(text))];
         }
 
-        return [Ansi.Bold(text)];
+        return [new(Ansi.Bold(text))];
     }
 
     private static (string Marker, string Text)? TryParseOrderedList(string line)

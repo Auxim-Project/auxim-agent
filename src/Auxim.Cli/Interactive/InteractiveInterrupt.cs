@@ -79,7 +79,8 @@ internal sealed class InteractiveInterrupt : IDisposable
 
     public bool TakeIdleInterrupt() => Interlocked.Exchange(ref _idleInterrupt, 0) != 0;
 
-    public async Task<T> AwaitTurnAsync<T>(Task<T> operation, Action? cancelling = null)
+    public async Task<T> AwaitTurnAsync<T>(Task<T> operation, Action? cancelling = null,
+        Func<TerminalInputEvent, ValueTask<bool>>? navigate = null)
     {
         var announced = false;
         try
@@ -88,7 +89,16 @@ internal sealed class InteractiveInterrupt : IDisposable
             {
                 // Approval has exclusive input ownership. No competing read is
                 // made there, nor while a child owns the cooked terminal.
-                TerminalInput.PollRunningCancellation();
+                var navigation = TerminalInput.PollRunningCancellation(navigate is not null);
+                var leftHistory = false;
+                if (navigate is not null)
+                    foreach (var input in navigation)
+                    {
+                        if (operation.IsCompleted || State == InteractiveExecutionState.Cancelling) break;
+                        // This batch is already outside the decoder queue.
+                        if (leftHistory && input.Kind == TerminalInputEventKind.MouseWheel) continue;
+                        leftHistory |= await navigate(input);
+                    }
                 if (!announced && State == InteractiveExecutionState.Cancelling)
                 {
                     cancelling?.Invoke();
@@ -106,6 +116,7 @@ internal sealed class InteractiveInterrupt : IDisposable
             try { await operation; } catch { /* Preserve the original failure. */ }
             throw;
         }
+        finally { TerminalInput.DiscardRunningInput(); }
     }
 
     public void Dispose()

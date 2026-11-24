@@ -55,6 +55,25 @@ public sealed class TranscriptViewportTests
     }
 
     [Fact]
+    public void NewLiveLinesKeepTheReadingPositionUntilFollowResumes()
+    {
+        var viewport = new TranscriptViewport();
+        var transcript = new StreamingTranscript(() => History, "latest user", viewport);
+        transcript.Append("first response line\nsecond response line");
+        transcript.Prepare(40, 3);
+        Assert.Equal("  second response line", viewport.GetVisibleLines(3).Last());
+
+        viewport.ScrollClamped(-2, 3);
+        var before = viewport.GetVisibleLines(3).ToArray();
+        transcript.Append("\nnew response line");
+        transcript.Prepare(40, 3, followBottom: false);
+        Assert.Equal(before, viewport.GetVisibleLines(3));
+
+        transcript.Prepare(40, 3, followBottom: true);
+        Assert.Equal("  new response line", viewport.GetVisibleLines(3).Last());
+    }
+
+    [Fact]
     public void ResizingClampsThePositionWithoutJumpingBackWhenShrinking()
     {
         var viewport = new TranscriptViewport();

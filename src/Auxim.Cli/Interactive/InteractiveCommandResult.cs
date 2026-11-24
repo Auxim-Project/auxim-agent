@@ -13,8 +13,8 @@ internal sealed record InteractiveCommandResult(int ExitCode, IReadOnlyList<stri
         var command = parts.FirstOrDefault()?.ToLowerInvariant();
         var subcommand = parts.Skip(1).FirstOrDefault();
         if (command is "exit" or "quit" or "q" or "history" or "show" or "jump" or "goto"
-            or "tail" or "resume" or "sessions" or "new" or "clear" or "redraw" or "welcome"
-            || command == "session" && (subcommand == "list" || subcommand == "use" && parts.Count == 2))
+            or "tail" or "new" or "clear" or "redraw" or "welcome"
+            || command == "session" && subcommand is null)
             return CommandPresentation.Navigation;
         if (command == "model" && subcommand == "set" && parts.Count == 2
             || command == "auth" && subcommand == "set-api-key" && (parts.Count < 3 || string.IsNullOrWhiteSpace(parts[2]))

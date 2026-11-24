@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using Auxim.Core.Approval;
 
@@ -5,345 +7,175 @@ namespace Auxim.Cli.Interactive;
 
 internal static class ApprovalRenderer
 {
+    internal static readonly string[] Options = ["Allow once", "Always allow", "Deny and give feedback"];
+
     public static async Task<ApprovalResponse> PromptAsync(
         ApprovalRequest request,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        InteractiveView? view = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        using var mouse = TerminalMouse.SuspendAlternateScroll();
         using var inputOwner = TerminalInput.BeginApproval(out var inputFailure);
         if (inputOwner is null) return ApprovalResponse.Deny(inputFailure ?? "Safe terminal input is unavailable.");
-        using var scrollSuspension = TerminalMouse.SuspendAlternateScroll();
-        var width = Math.Max(20, Math.Min(ConsoleTheme.ConsoleWidth(), 96));
 
-        Console.WriteLine();
-        Console.WriteLine(Ansi.Warning($"{TerminalGlyphs.TopLeft}{TerminalGlyphs.HorizontalLine(width - 2)}{TerminalGlyphs.TopRight}"));
-        WriteBoxLines(
-            $"{Ansi.Bold("SAFETY REVIEW")}  {Ansi.Muted("Tool approval required")}",
-            width);
-        WriteBoxLines(
-            $"{ConsoleTheme.Chip("tool", request.ToolName)}  {Ansi.WarningBackground(" resource access ")}",
-            width);
-        WriteBoxLines($"{Ansi.Muted("request")}  {request.RequestId}", width);
-        WriteBoxLines(
-            $"{Ansi.Muted("risk")}  This tool can modify files, run commands, or change state.",
-            width);
-        Console.WriteLine(Ansi.Warning($"{TerminalGlyphs.TeeLeft}{TerminalGlyphs.HorizontalLine(width - 2)}{TerminalGlyphs.TeeRight}"));
-        WriteBoxLines($"{Ansi.Cyan(TerminalGlyphs.Section)} {Ansi.Bold("Arguments")}", width);
-        foreach (var arg in FormatArgumentsForDisplay(request.Arguments))
-        {
-            WriteBoxLines($"  {Ansi.Muted(arg.Key.PadRight(14))} {arg.Value}", width);
-        }
-
-        WriteBoxLines($"{Ansi.Cyan(TerminalGlyphs.Section)} {Ansi.Bold("Resources")}", width);
-        foreach (var access in request.ResourceAccesses)
-        {
-            WriteBoxLines($"  {access.Action}  {access.Resource}", width);
-        }
-
-        Console.WriteLine(Ansi.Warning($"{TerminalGlyphs.TeeLeft}{TerminalGlyphs.HorizontalLine(width - 2)}{TerminalGlyphs.TeeRight}"));
-        WriteBoxLines($"{Ansi.Cyan(TerminalGlyphs.Section)} {Ansi.Bold("Decision")}", width);
-        var options = new[]
-        {
-            (Label: "Allow once", Tone: "success", Value: 1),
-            (Label: "Always allow", Tone: "warning", Value: 2),
-            (Label: "Deny and give feedback", Tone: "danger", Value: 3),
-        };
-
+        var details = Describe(request);
+        var panel = view?.CanEmbedApproval == true ? new ApprovalPanel(view, details) : null;
+        var compact = panel is null && view?.UsesFixedLayout == true;
+        // Alternate buffers may have no native scrollback. In compact fallback
+        // keep every detail reachable with PgUp/PgDn using a plain console pager.
+        if (compact) EnsureCompactFits();
+        var viewport = new TranscriptViewport();
+        var pageHeight = 0;
+        (int Width, int Height) compactSize = default;
         var selected = 0;
-
-        RenderOptions(options, selected, width);
-        RenderHint(width);
-        Console.WriteLine(Ansi.Warning($"{TerminalGlyphs.BottomLeft}{TerminalGlyphs.HorizontalLine(width - 2)}{TerminalGlyphs.BottomRight}"));
-
-        while (true)
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var input = await TerminalInput.ReadAsync(
-                TerminalInputPolicy.Approval,
-                cancellationToken);
-            if (input.Kind is TerminalInputEventKind.PasteStarted or TerminalInputEventKind.Paste
-                or TerminalInputEventKind.ControlSequence or TerminalInputEventKind.EndOfInput)
-                return ApprovalResponse.Deny("Pasted, ambiguous, or closed terminal input cannot confirm approval. Retry with keyboard input.");
-            if (input.Kind != TerminalInputEventKind.Key) continue;
+            if (compact) view!.SuspendLayout(clear: false);
+            if (panel is null && !compact) PrintDetails(details);
+            Draw();
 
-            var key = input.Key;
-            switch (key.Key)
+            while (true)
             {
-                case ConsoleKey.D1:
-                case ConsoleKey.NumPad1:
-                    selected = 0;
-                    RedrawOptions(options, selected, width);
-                    break;
-                case ConsoleKey.D2:
-                case ConsoleKey.NumPad2:
-                    selected = 1;
-                    RedrawOptions(options, selected, width);
-                    break;
-                case ConsoleKey.D3:
-                case ConsoleKey.NumPad3:
-                    selected = 2;
-                    RedrawOptions(options, selected, width);
-                    break;
-                case ConsoleKey.UpArrow:
-                    if (selected > 0)
-                    {
-                        selected--;
-                        RedrawOptions(options, selected, width);
-                    }
+                var input = await TerminalInput.ReadAsync(TerminalInputPolicy.Approval, cancellationToken,
+                    panel is not null ? Draw : compact ? RefreshCompact : null);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (input.Kind is TerminalInputEventKind.PasteStarted or TerminalInputEventKind.Paste
+                    or TerminalInputEventKind.ControlSequence or TerminalInputEventKind.EndOfInput)
+                    return ApprovalResponse.Deny("Pasted, ambiguous, or closed terminal input cannot confirm approval. Retry with keyboard input.");
+                if (input.Kind != TerminalInputEventKind.Key) continue;
 
-                    break;
-                case ConsoleKey.DownArrow:
-                    if (selected < options.Length - 1)
-                    {
-                        selected++;
-                        RedrawOptions(options, selected, width);
-                    }
-
-                    break;
-                case ConsoleKey.Enter:
-                    cancellationToken.ThrowIfCancellationRequested();
-                    return CompleteSelection(selected, options.Length, cancellationToken);
-            }
-        }
-    }
-
-    private static ApprovalResponse CompleteSelection(
-        int selected,
-        int optionCount,
-        CancellationToken cancellationToken)
-    {
-        ClearOptionsBlock(optionCount);
-        switch (selected)
-        {
-            case 0:
-                Console.WriteLine(Ansi.Success("Allowed. Continuing."));
-                Console.WriteLine();
-                return ApprovalResponse.Allow();
-            case 1:
-                Console.WriteLine(Ansi.Success("Always allowed. Future calls to this tool will not prompt."));
-                Console.WriteLine();
-                return ApprovalResponse.Allow(remember: true);
-            default:
-                Console.Write(Ansi.Warning("Feedback for the model: "));
-                var reason = new LineEditor([], _ => []).ReadLine("", "",
-                    inputPolicy: TerminalInputPolicy.Feedback, cancellationToken: cancellationToken);
-                reason = string.IsNullOrWhiteSpace(reason)
-                    ? "User denied this tool call."
-                    : reason.Trim();
-                Console.WriteLine(Ansi.Error("Denied. Feedback was sent to the model."));
-                Console.WriteLine();
-                return ApprovalResponse.Deny(reason);
-        }
-    }
-
-    private static void RenderOptions((string Label, string Tone, int Value)[] options, int selected, int width)
-    {
-        for (var i = 0; i < options.Length; i++)
-        {
-            var marker = i == selected ? ">" : " ";
-            var label = $"  {marker}  {i + 1}  {options[i].Label.PadRight(34)}";
-            var rendered = i == selected
-                ? SelectedOption(label, options[i].Tone)
-                : Ansi.Muted(label);
-            Console.WriteLine(BoxLine(rendered, width));
-        }
-    }
-
-    private static void RedrawOptions((string Label, string Tone, int Value)[] options, int selected, int width)
-    {
-        ClearOptionsBlock(options.Length);
-        RenderOptions(options, selected, width);
-        RenderHint(width);
-        Console.WriteLine(Ansi.Warning($"{TerminalGlyphs.BottomLeft}{TerminalGlyphs.HorizontalLine(width - 2)}{TerminalGlyphs.BottomRight}"));
-    }
-
-    private static void ClearOptionsBlock(int optionCount)
-    {
-        if (Ansi.ControlSequencesEnabled)
-        {
-            Console.Write("\r");
-            Console.Write($"\u001b[{optionCount + 2}A");
-            Console.Write("\u001b[0J");
-            return;
-        }
-
-        Console.WriteLine();
-    }
-
-    private static void RenderHint()
-    {
-        RenderHint(Math.Min(ConsoleTheme.ConsoleWidth(), 96));
-    }
-
-    private static void RenderHint(int width)
-    {
-        WriteBoxLines(Ansi.Muted("  Up/Down select   Enter confirm   1/2/3 select then Enter"), width);
-    }
-
-    private static string SelectedOption(string text, string tone)
-    {
-        return tone switch
-        {
-            "success" => Ansi.AccentBackground(text),
-            "warning" => Ansi.WarningBackground(text),
-            "danger" => Ansi.ErrorBackground(text),
-            _ => Ansi.Reverse(text),
-        };
-    }
-
-    private static string Pad(string text, int width)
-    {
-        return text.Length >= width ? text[..width] : text + new string(' ', width - text.Length);
-    }
-
-    private static string BoxLine(string content, int width)
-    {
-        var available = width - 4;
-        var fitted = ConsoleTheme.FitVisible(content, available);
-        var visible = StripAnsi(fitted);
-        var padded = visible.Length >= available ? fitted : fitted + new string(' ', available - visible.Length);
-        return $"{Ansi.Warning(TerminalGlyphs.Vertical)} {padded} {Ansi.Warning(TerminalGlyphs.Vertical)}";
-    }
-
-    private static void WriteBoxLines(string content, int width)
-    {
-        foreach (var line in ConsoleTheme.WrapVisible(content, width - 4))
-        {
-            Console.WriteLine(BoxLine(line, width));
-        }
-    }
-
-    private static string StripAnsi(string text)
-    {
-        var result = new List<char>();
-        var inEscape = false;
-        foreach (var character in text)
-        {
-            if (character == '\u001b')
-            {
-                inEscape = true;
-                continue;
-            }
-
-            if (inEscape)
-            {
-                if (char.IsLetter(character))
+                switch (input.Key.Key)
                 {
-                    inEscape = false;
+                    case ConsoleKey.D1 or ConsoleKey.NumPad1: selected = 0; break;
+                    case ConsoleKey.D2 or ConsoleKey.NumPad2: selected = 1; break;
+                    case ConsoleKey.D3 or ConsoleKey.NumPad3: selected = 2; break;
+                    case ConsoleKey.UpArrow: selected = Math.Max(0, selected - 1); break;
+                    case ConsoleKey.DownArrow: selected = Math.Min(Options.Length - 1, selected + 1); break;
+                    case ConsoleKey.PageUp:
+                    case ConsoleKey.PageDown:
+                        var direction = input.Key.Key == ConsoleKey.PageUp ? -1 : 1;
+                        if (panel is not null) panel.Scroll(direction);
+                        else if (!compact || !viewport.ScrollClamped(direction * pageHeight, pageHeight)) continue;
+                        break;
+                    case ConsoleKey.Enter:
+                        if (selected < 2) return ApprovalResponse.Allow(remember: selected == 1);
+                        return ReadFeedback(panel, cancellationToken);
+                    default: continue;
                 }
-
-                continue;
+                Draw();
             }
-
-            result.Add(character);
+        }
+        finally
+        {
+            if (panel is not null) view!.EndApprovalPanel();
+            else if (compact) view!.RestoreLayout(restoreMouse: false);
         }
 
-        return new string(result.ToArray());
-    }
-
-    private static IReadOnlyList<(string Key, string Value)> FormatArgumentsForDisplay(
-        IReadOnlyDictionary<string, object?> arguments)
-    {
-        var result = new List<(string Key, string Value)>();
-        foreach (var (key, value) in arguments)
+        void RefreshCompact()
         {
-            if (value is null)
+            EnsureCompactFits();
+            if (compactSize != (Console.WindowWidth, Console.WindowHeight)) Draw();
+        }
+
+        void Draw()
+        {
+            if (panel is not null) panel.Draw(selected);
+            else if (compact)
             {
-                result.Add((key, Ansi.Muted("(null)")));
-                continue;
+                InteractiveScreen.Clear();
+                // Wrap before paging. Reserve space for every choice and the
+                // active decision even on a narrow terminal.
+                compactSize = (Console.WindowWidth, Console.WindowHeight);
+                var width = Math.Max(1, compactSize.Width - 1);
+                var height = Math.Max(1, compactSize.Height);
+                var choice = $"Decision: {selected + 1}. {Options[selected]}";
+                var instructions = TerminalTextLayout.Wrap("1/2/3 select · Enter confirms", width);
+                var choiceRows = TerminalTextLayout.Wrap(choice, width);
+                pageHeight = Math.Max(1, height - instructions.Count - choiceRows.Count - 3);
+                viewport.Reflow(details.SelectMany(line => TerminalTextLayout.Wrap(line, width)).ToArray(),
+                    pageHeight, followBottom: false);
+                Console.WriteLine("SAFETY REVIEW");
+                foreach (var line in viewport.GetVisibleLines(pageHeight)) Console.WriteLine(line);
+                Console.WriteLine($"PgUp/Dn {viewport.Offset + 1}/{viewport.TotalLines}");
+                foreach (var line in instructions.Concat(choiceRows)) Console.WriteLine(line);
             }
-
-            var displayKey = FormatKeyName(key);
-            var displayValue = FormatValue(value);
-            result.Add((displayKey, displayValue));
+            else
+            {
+                // Keep details in native scrollback. Selection changes never erase it.
+                Console.WriteLine($"Decision: {selected + 1}. {Options[selected]}");
+            }
         }
-
-        return result;
     }
 
-    private static string FormatKeyName(string key)
+    private static void EnsureCompactFits()
     {
-        return key switch
+        if (Console.WindowHeight < 10 || Console.WindowWidth < 24)
+            throw new InvalidOperationException("Terminal is too small to review the approval. Resize and retry.");
+    }
+
+    private static ApprovalResponse ReadFeedback(ApprovalPanel? panel, CancellationToken token)
+    {
+        if (panel is null) Console.Write(Ansi.Warning("Feedback for the model: "));
+        var reason = new LineEditor([], _ => [], inputLayout: panel is null ? null : _ => panel.DrawFeedback())
+            .ReadLine("", "", inputPolicy: TerminalInputPolicy.Feedback, cancellationToken: token);
+        token.ThrowIfCancellationRequested();
+        return ApprovalResponse.Deny(string.IsNullOrWhiteSpace(reason) ? "User denied this tool call." : reason.Trim());
+    }
+
+    private static void PrintDetails(IReadOnlyList<string> details)
+    {
+        Console.WriteLine();
+        Console.WriteLine(Ansi.Warning("SAFETY REVIEW · Tool approval required"));
+        foreach (var line in details) Console.WriteLine(line);
+        foreach (var (option, i) in Options.Select((value, index) => (value, index)))
+            Console.WriteLine($"  {i + 1}. {option}");
+        Console.WriteLine("Up/Down or 1/2/3 selects · Enter confirms · Ctrl+C cancels");
+    }
+
+    private static IReadOnlyList<string> Describe(ApprovalRequest request)
+    {
+        var lines = new List<string>
         {
-            "command" => "command",
-            "timeoutSeconds" => "timeoutSeconds",
-            "path" => "path",
-            "content" => "content",
-            "oldText" => "oldText",
-            "newText" => "newText",
-            "text" => "text",
-            "maxResults" => "maxResults",
-            "pattern" => "pattern",
-            "url" => "url",
-            "name" => "name",
-            "description" => "description",
-            "arguments" => "arguments",
-            "id" => "ID",
-            "message" => "message",
-            "reason" => "reason",
-            "feedback" => "feedback",
-            "instruction" => "instruction",
-            _ => key,
+            $"Tool: {Display(request.ToolName)}",
+            $"Request: {Display(request.RequestId)}",
+            "Risk: This tool can modify files, run commands, or change state.",
+            "Always allow remembers the requested resource permissions for future calls.",
+            "Arguments:"
         };
-    }
-
-    private static string FormatValue(object? value)
-    {
-        if (value is null)
+        foreach (var (key, value) in request.Arguments)
         {
-            return Ansi.Muted("(null)");
-        }
-
-        if (value is string str)
-        {
-            if (str.Length == 0)
+            var valueText = value switch
             {
-                return Ansi.Muted("(empty string)");
-            }
-
-            if (str.Length <= 120)
-            {
-                return Clean(str);
-            }
-
-            return $"{Clean(str[..120])}{Ansi.Muted("...")} ({str.Length} chars)";
-        }
-
-        if (value is bool b)
-        {
-            return b ? Ansi.Success("true") : Ansi.Error("false");
-        }
-
-        if (value is JsonElement je)
-        {
-            return je.ValueKind switch
-            {
-                JsonValueKind.String => FormatValue(je.GetString()),
-                JsonValueKind.Number => je.GetRawText(),
-                JsonValueKind.True => Ansi.Success("true"),
-                JsonValueKind.False => Ansi.Error("false"),
-                JsonValueKind.Object => je.GetRawText(),
-                JsonValueKind.Array => $"[{string.Join(", ", je.EnumerateArray().Select(e => FormatValue(e)))}]",
-                JsonValueKind.Null => Ansi.Muted("(null)"),
-                _ => je.GetRawText(),
+                null => "(null)",
+                string { Length: 0 } => "(empty string)",
+                string str => str,
+                JsonElement { ValueKind: JsonValueKind.String } json => json.GetString() ?? "",
+                JsonElement json => json.GetRawText(),
+                _ => JsonSerializer.Serialize(value)
             };
+            lines.Add($"  {Display(key)}: {Display(valueText)}");
         }
 
-        var text = value.ToString() ?? "";
-        if (text.Length <= 120)
-        {
-            return text;
-        }
-
-        return $"{text[..120]}{Ansi.Muted("...")} ({text.Length} chars)";
+        lines.Add("Resources:");
+        foreach (var access in request.ResourceAccesses)
+            lines.Add($"  {Display(access.Action.ToString())}  {Display(access.Resource.ToString())}");
+        return lines;
     }
 
-    private static string Clean(string s)
+    // Approval data is untrusted. Show control and format characters as text
+    // rather than permitting terminal commands or invisible direction changes.
+    private static string Display(string text)
     {
-        return s
-            .Replace("\r\n", "\\n")
-            .Replace("\n", "\\n")
-            .Replace("\r", "\\r")
-            .Replace("\t", "\\t");
+        var result = new StringBuilder(text.Length);
+        foreach (var rune in text.EnumerateRunes())
+        {
+            if (Rune.GetUnicodeCategory(rune) is UnicodeCategory.Control or UnicodeCategory.Format
+                or UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator)
+                result.Append(rune.Value <= 0xffff ? $"\\u{rune.Value:x4}" : $"\\U{rune.Value:x8}");
+            else if (rune.Value == '\\') result.Append("\\\\");
+            else result.Append(rune.ToString());
+        }
+        return result.ToString();
     }
 }

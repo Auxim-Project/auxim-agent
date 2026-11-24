@@ -14,7 +14,9 @@ internal sealed class StreamingPreviewRenderer(
     StreamingTranscript transcript,
     Func<ScreenLayout>? prepareLayout = null,
     Action? suspendLayout = null,
-    Action? resumeLayout = null)
+    Action? resumeLayout = null,
+    Action<string>? appendWorkspace = null,
+    Action? refreshWorkspace = null)
 {
     private string[] _previous = [];
     private (int Width, int Height) _lastSize;
@@ -33,6 +35,7 @@ internal sealed class StreamingPreviewRenderer(
         if (plain.Length == 0) return;
         _hadText = true;
         transcript.Append(plain);
+        appendWorkspace?.Invoke(plain);
         if (mode == PreviewOutputMode.Redirected)
         {
             if (!_segmentVisible) diagnostics.Write("[preview] ");
@@ -46,6 +49,11 @@ internal sealed class StreamingPreviewRenderer(
     public void Refresh()
     {
         if (_suspended || mode == PreviewOutputMode.Redirected) return;
+        if (refreshWorkspace is not null)
+        {
+            refreshWorkspace();
+            return;
+        }
         var dimensions = size();
         var previousLayout = _layout;
         if (mode == PreviewOutputMode.Alternate)
@@ -144,7 +152,8 @@ internal sealed class StreamingPreviewRenderer(
 
     public void Suspend()
     {
-        ClearRegion();
+        if (mode != PreviewOutputMode.Alternate || suspendLayout is not null)
+            ClearRegion();
         _suspended = true;
         suspendLayout?.Invoke();
     }

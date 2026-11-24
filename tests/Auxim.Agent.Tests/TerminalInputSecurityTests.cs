@@ -176,6 +176,26 @@ public sealed class TerminalInputSecurityTests
     }
 
     [Fact]
+    public void HistoryExitDropsQueuedAndFragmentedWheelOnly()
+    {
+        var decoder = new TerminalInputDecoder();
+        decoder.Feed("\u001b[<64;2;2M\u001b[Bx\u001b[<65;2;"u8);
+        decoder.DiscardQueuedWheel();
+        decoder.Feed("2M\u001b[<65;2;2M"u8);
+        var events = Drain(decoder);
+        Assert.Equal(3, events.Count);
+        Assert.Equal(ConsoleKey.DownArrow, events[0].Key.Key);
+        Assert.Equal('x', events[1].Key.KeyChar);
+        Assert.Equal(TerminalInputEventKind.MouseWheel, events[2].Kind);
+
+        decoder.Feed("\u001b[<65;2;"u8);
+        decoder.DiscardQueuedWheel();
+        decoder.Feed("\u001b[<64;2;2M"u8);
+        Assert.Equal(new[] { TerminalInputEventKind.ControlSequence, TerminalInputEventKind.MouseWheel },
+            Drain(decoder).Select(value => value.Kind));
+    }
+
+    [Fact]
     public void AnEscapeAfterAQueuedSubmissionSurvivesTheApprovalHandoff()
     {
         var decoder = new TerminalInputDecoder();

@@ -6,16 +6,27 @@ internal enum TerminalInputEventKind { Ignored, Key, EscapeBoundary, PasteStarte
 internal enum PointerPhase { Press, Drag, Release }
 internal sealed record TerminalPointer(int Button, int X, int Y, ConsoleModifiers Modifiers, PointerPhase Phase);
 internal readonly record struct TerminalInputEvent(TerminalInputEventKind Kind, ConsoleKeyInfo Key, string? Text = null,
-    int ScrollDelta = 0, TerminalPointer? Pointer = null, int? KittyCode = null, int KittyModifiers = 0);
+    int ScrollDelta = 0, TerminalPointer? Pointer = null, int? KittyCode = null, int KittyModifiers = 0)
+{
+    public bool IsCtrlC => Kind == TerminalInputEventKind.Key
+        && Key is { Key: ConsoleKey.C, Modifiers: ConsoleModifiers.Control };
+    public bool IsSuperC => Kind == TerminalInputEventKind.Key
+        && Key is { Key: ConsoleKey.C, Modifiers: 0 } && (KittyModifiers & 63) == 8;
+}
+
+internal sealed class ConfigurationPromptCancelledException : OperationCanceledException;
 
 internal sealed class TerminalInputPolicy(Func<ConsoleKeyInfo, bool> acceptKey)
 {
     public bool AcceptsKey(ConsoleKeyInfo key) => acceptKey(key);
     public static TerminalInputPolicy LineEditor { get; } = new(_ => true);
+    public static TerminalInputPolicy HistoryEditor { get; } = new(_ => true);
+    public static TerminalInputPolicy ConfigurationPrompt { get; } = new(_ => true);
     public static TerminalInputPolicy Secret { get; } = new(_ => true);
     public static TerminalInputPolicy Feedback { get; } = new(_ => true);
     public static TerminalInputPolicy Approval { get; } = new(key =>
         key.Modifiers == 0 && key.Key is ConsoleKey.UpArrow or ConsoleKey.DownArrow
+            or ConsoleKey.PageUp or ConsoleKey.PageDown
             or ConsoleKey.D1 or ConsoleKey.D2 or ConsoleKey.D3
             or ConsoleKey.NumPad1 or ConsoleKey.NumPad2 or ConsoleKey.NumPad3
         || key.Key == ConsoleKey.Enter && (key.Modifiers == 0
@@ -25,7 +36,7 @@ internal sealed class TerminalInputPolicy(Func<ConsoleKeyInfo, bool> acceptKey)
 internal static class TerminalInput
 {
     private static readonly object Sync = new();
-    private static PosixTerminalInput? _input;
+    private static ITerminalInputBackend? _input;
     private static bool _initialized;
     private static bool _approval;
     private static int _suspended;
@@ -56,7 +67,7 @@ internal static class TerminalInput
     private static void Initialize()
     {
         if (_initialized) return;
-        try { _input = PosixTerminalInput.Create(); }
+        try { _input = OperatingSystem.IsWindows() ? WindowsTerminalInput.Create() : PosixTerminalInput.Create(); }
         catch (Exception error) when (error is DllNotFoundException or EntryPointNotFoundException or PlatformNotSupportedException)
         { _input = null; }
         _initialized = true;
@@ -102,7 +113,8 @@ internal static class TerminalInput
                 throw new InvalidOperationException("Approval owns terminal input.");
             if (_input is null)
             {
-                if (policy != TerminalInputPolicy.LineEditor) throw new IOException("Safe terminal input is unavailable.");
+                if (policy != TerminalInputPolicy.LineEditor && policy != TerminalInputPolicy.HistoryEditor
+                    && policy != TerminalInputPolicy.ConfigurationPrompt) throw new IOException("Safe terminal input is unavailable.");
                 if (!Console.KeyAvailable) return null;
                 var key = Console.ReadKey(true);
                 return new(policy.AcceptsKey(key) ? TerminalInputEventKind.Key : TerminalInputEventKind.Ignored, key);
@@ -113,19 +125,25 @@ internal static class TerminalInput
             if (_input.Decoder.HasEvents)
             {
                 var value = _input.Decoder.Take();
-                if (value.Kind == TerminalInputEventKind.Key && value.Key.Key == ConsoleKey.C
-                    && value.Key.Modifiers == ConsoleModifiers.Control && InteractiveInterrupt.HandleSignal())
+                if (value.IsCtrlC && policy != TerminalInputPolicy.HistoryEditor && InteractiveInterrupt.HandleSignal())
                     return new(TerminalInputEventKind.ControlSequence, default);
-                // CSI-u is accepted only by the ordinary editor. In particular,
-                // encoded Enter/digits may never authorize an approval or feed secrets.
-                if (value.KittyCode is not null && policy != TerminalInputPolicy.LineEditor)
+                if (value.IsSuperC && policy != TerminalInputPolicy.HistoryEditor)
                     return new(TerminalInputEventKind.ControlSequence, default);
-                if (value.Kind == TerminalInputEventKind.LineBreak && policy != TerminalInputPolicy.LineEditor)
+                // CSI-u is accepted by text editors. Encoded Enter/digits may
+                // never authorize an approval or feed secrets.
+                if (value.KittyCode is not null && policy != TerminalInputPolicy.LineEditor && policy != TerminalInputPolicy.HistoryEditor
+                    && policy != TerminalInputPolicy.ConfigurationPrompt)
                     return new(TerminalInputEventKind.ControlSequence, default);
-                if (value.Kind is TerminalInputEventKind.MouseWheel or TerminalInputEventKind.Pointer && policy != TerminalInputPolicy.LineEditor)
+                // F2 and F3 are editor shortcuts. Keep their previous fail-closed
+                // treatment as a control sequence inside approval.
+                if (_approval && value.Kind == TerminalInputEventKind.Key && value.Key.Key is ConsoleKey.F2 or ConsoleKey.F3)
+                    return new(TerminalInputEventKind.ControlSequence, default);
+                if (value.Kind == TerminalInputEventKind.LineBreak && policy != TerminalInputPolicy.LineEditor && policy != TerminalInputPolicy.HistoryEditor)
+                    return new(TerminalInputEventKind.ControlSequence, default);
+                if (value.Kind is TerminalInputEventKind.MouseWheel or TerminalInputEventKind.Pointer && policy != TerminalInputPolicy.LineEditor && policy != TerminalInputPolicy.HistoryEditor)
                     return new(TerminalInputEventKind.ControlSequence, default);
                 if (value.Kind == TerminalInputEventKind.EscapeBoundary)
-                    return _approval || policy != TerminalInputPolicy.LineEditor
+                    return _approval || policy != TerminalInputPolicy.LineEditor && policy != TerminalInputPolicy.HistoryEditor
                         ? new(TerminalInputEventKind.ControlSequence, default)
                         : new(TerminalInputEventKind.Key, new ConsoleKeyInfo('\u001b', ConsoleKey.Escape, false, false, false));
                 if (value.Kind == TerminalInputEventKind.Key && !policy.AcceptsKey(value.Key))
@@ -146,20 +164,23 @@ internal static class TerminalInput
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (policy == TerminalInputPolicy.Secret && InteractiveInterrupt.Current?.TakeIdleInterrupt() == true)
-                return new(TerminalInputEventKind.EndOfInput, default);
-            if (TryRead(policy) is { } value) return value;
+            var configurationPrompt = policy == TerminalInputPolicy.ConfigurationPrompt || policy == TerminalInputPolicy.Secret;
+            if (configurationPrompt) ThrowIfConfigurationCancelled();
+            if (TryRead(policy) is { } value)
+            {
+                if (configurationPrompt) ThrowIfConfigurationCancelled();
+                return value;
+            }
             Thread.Sleep(10);
         }
     }
 
-    public static async ValueTask<TerminalInputEvent> ReadAsync(TerminalInputPolicy policy, CancellationToken cancellationToken)
+    public static async ValueTask<TerminalInputEvent> ReadAsync(TerminalInputPolicy policy, CancellationToken cancellationToken, Action? beforeRead = null)
     {
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (policy == TerminalInputPolicy.Secret && InteractiveInterrupt.Current?.TakeIdleInterrupt() == true)
-                return new(TerminalInputEventKind.EndOfInput, default);
+            beforeRead?.Invoke();
             if (TryRead(policy) is { } value) return value;
             await Task.Delay(10, cancellationToken);
         }
@@ -167,20 +188,100 @@ internal static class TerminalInput
 
     // Called only by the active turn's await loop. Other typing is discarded,
     // while incomplete paste/control framing remains quarantined for all readers.
-    public static void PollRunningCancellation()
+    public static IReadOnlyList<TerminalInputEvent> PollRunningCancellation(bool readNavigation)
+    {
+        List<TerminalInputEvent>? navigation = null;
+        lock (Sync)
+        {
+            if (_approval || _suspended > 0 || _input is null) return [];
+            if (_input.ReadAvailable()) _lastBytesAt = Environment.TickCount64;
+            if (readNavigation) ReleaseIdleEditorEscape();
+            while (_input.Decoder.HasEvents)
+            {
+                var value = _input.Decoder.Take();
+                if (value.IsCtrlC && !readNavigation)
+                {
+                    InteractiveInterrupt.HandleSignal();
+                    continue;
+                }
+                if (readNavigation && IsRunningNavigation(value))
+                    (navigation ??= []).Add(value);
+            }
+            _input.Decoder.DiscardPastePayload();
+            if (_input.EndOfInput) InteractiveInterrupt.HandleSignal();
+        }
+        return navigation ?? [];
+    }
+
+    private static bool IsRunningNavigation(TerminalInputEvent value) =>
+        value.IsCtrlC || value.IsSuperC
+        || value.Kind is TerminalInputEventKind.MouseWheel or TerminalInputEventKind.Pointer or TerminalInputEventKind.EscapeBoundary
+        || value.Kind == TerminalInputEventKind.Key
+            && (value.Key.Modifiers == 0 && value.Key.Key is ConsoleKey.Escape or ConsoleKey.UpArrow
+                or ConsoleKey.DownArrow or ConsoleKey.PageUp or ConsoleKey.PageDown or ConsoleKey.End or ConsoleKey.F2
+                || value.Key is { Key: ConsoleKey.R, Modifiers: ConsoleModifiers.Control });
+
+    internal static void DiscardRunningInput()
+    {
+        lock (Sync)
+        {
+            if (_approval || _suspended > 0 || _input is null || !InteractiveScreen.IsAlternateScreenActive) return;
+            // The editor may already have ordinary keystrokes waiting behind
+            // the mouse reports. Preserve those while draining available bytes.
+            _input.Decoder.DiscardQueuedNavigation();
+            try
+            {
+                for (var i = 0; i < 16 && _input.ReadAvailable(); i++)
+                    _input.Decoder.DiscardQueuedNavigation();
+            }
+            catch (IOException) { /* A closing terminal has no editor to receive the reports. */ }
+        }
+    }
+
+    public static void ThrowIfConfigurationCancelled()
+    {
+        if (InteractiveInterrupt.Current?.TakeIdleInterrupt() == true)
+            throw new ConfigurationPromptCancelledException();
+    }
+
+    public static void DiscardConfigurationInput()
+    {
+        lock (Sync)
+        {
+            _input?.DiscardPending();
+            InteractiveInterrupt.Current?.TakeIdleInterrupt();
+        }
+    }
+
+    public static void SetHistoryCopyControl(bool enabled)
+    {
+        lock (Sync)
+        {
+            if (!_approval && _suspended == 0) _input?.SetCtrlCInput(enabled);
+        }
+    }
+
+    public static void SetNativeMouseInput(TerminalMouseMode mode)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        lock (Sync) _input?.SetMouseInput(mode);
+    }
+
+    public static void DiscardHistoryWheel()
     {
         lock (Sync)
         {
             if (_approval || _suspended > 0 || _input is null) return;
-            if (_input.ReadAvailable()) _lastBytesAt = Environment.TickCount64;
-            while (_input.Decoder.HasEvents)
+            var decoder = _input.Decoder;
+            decoder.DiscardQueuedWheel();
+            try
             {
-                var value = _input.Decoder.Take();
-                if (value.Kind == TerminalInputEventKind.Key && value.Key.Key == ConsoleKey.C
-                    && value.Key.Modifiers == ConsoleModifiers.Control) InteractiveInterrupt.HandleSignal();
+                // Include reports already available on the terminal, even when
+                // the first read ended at Esc or inside a fragmented CSI.
+                for (var i = 0; i < 16 && _input.ReadAvailable(); i++)
+                    decoder.DiscardQueuedWheel();
             }
-            _input.Decoder.DiscardPastePayload();
-            if (_input.EndOfInput) InteractiveInterrupt.HandleSignal();
+            catch (IOException) { /* A closing terminal has no view to navigate. */ }
         }
     }
 
@@ -202,7 +303,7 @@ internal static class TerminalInput
         lock (Sync)
         {
             Initialize();
-            if (_input is null || !Ansi.ControlSequencesEnabled) return null;
+            if (_input is not PosixTerminalInput || !Ansi.ControlSequencesEnabled) return null;
             if (_approval || _suspended > 0) throw new InvalidOperationException("Another foreground owner holds input.");
             _input.Activate();
             _input.SetPasteMode(true);
@@ -226,9 +327,10 @@ internal static class TerminalInput
         {
             failure = null;
             Initialize();
-            if (_input is null) { failure = "Raw terminal input is unavailable; approval was denied safely."; return null; }
+            if (!(_input is PosixTerminalInput)) { failure = "Raw terminal input is unavailable; approval was denied safely."; return null; }
             if (_approval) { failure = "Another approval owns terminal input."; return null; }
             _input.Activate();
+            _input.SetCtrlCInput(false);
             if (!_input.DiscardPending() || _input.Decoder.HasPartialSequence)
             {
                 if (_suspended > 0) _input.Suspend();

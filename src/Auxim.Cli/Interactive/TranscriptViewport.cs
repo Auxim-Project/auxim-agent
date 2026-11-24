@@ -50,10 +50,11 @@ internal sealed class TranscriptViewport
         IsActive = true;
     }
 
-    public void UpdateTemporary(IReadOnlyList<string> physicalRows, int pageHeight)
+    public void UpdateTemporary(IReadOnlyList<string> physicalRows, int pageHeight, bool followBottom = true)
     {
         _temporary = physicalRows;
-        Offset = Math.Max(0, TotalLines - pageHeight);
+        var bottom = Math.Max(0, TotalLines - pageHeight);
+        Offset = followBottom ? bottom : Math.Clamp(Offset, 0, bottom);
     }
 
     public void EndTemporary()

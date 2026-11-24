@@ -18,16 +18,31 @@ public sealed class InteractiveCommandResultTests
     [InlineData("tool run", CommandPresentation.Result)]
     [InlineData("tool run echo", CommandPresentation.Foreground)]
     [InlineData("tool list", CommandPresentation.Result)]
-    [InlineData("session list", CommandPresentation.Navigation)]
-    [InlineData("session use", CommandPresentation.Navigation)]
+    [InlineData("session", CommandPresentation.Navigation)]
+    [InlineData("session search words", CommandPresentation.Result)]
+    [InlineData("session help", CommandPresentation.Result)]
+    [InlineData("session list", CommandPresentation.Result)]
+    [InlineData("session use", CommandPresentation.Result)]
     [InlineData("session use known", CommandPresentation.Result)]
-    [InlineData("sessions", CommandPresentation.Navigation)]
-    [InlineData("resume", CommandPresentation.Navigation)]
+    [InlineData("sessions", CommandPresentation.Result)]
+    [InlineData("resume", CommandPresentation.Result)]
     [InlineData("help", CommandPresentation.Result)]
     [InlineData("status", CommandPresentation.Result)]
     [InlineData("doctor", CommandPresentation.Result)]
     public void PresentationDependsOnSubcommandAndArguments(string command, object expected)
         => Assert.Equal((CommandPresentation)expected, InteractiveCommandResult.Classify(InteractiveCommandParser.Tokenize(command)));
+
+    [Fact]
+    public void CompletionUsesOnlyTheCurrentCommandContext()
+    {
+        Assert.Equal(["/session"], InteractiveCommandCatalog.Complete("/ses"));
+        Assert.Equal(["/session clear"], InteractiveCommandCatalog.Complete("/SESSION cl"));
+        Assert.Empty(InteractiveCommandCatalog.Complete("/SESSION se"));
+        Assert.Empty(InteractiveCommandCatalog.Complete("/resu"));
+        Assert.Equal(["/session help"], InteractiveCommandCatalog.Complete("/session h"));
+        Assert.Empty(InteractiveCommandCatalog.Complete("/session search already-typed"));
+        Assert.Empty(InteractiveCommandCatalog.Complete("/session\n"));
+    }
 
     [Fact]
     public void CaptureRetainsOutputOrderAndFailureAndRestoresBothWriters()
