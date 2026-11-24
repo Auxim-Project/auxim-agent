@@ -2,7 +2,22 @@ namespace Auxim.Cli.Interactive;
 
 internal static class TerminalGlyphs
 {
-    public static bool UnicodeEnabled => !ShouldUseAscii();
+    private static readonly AsyncLocal<bool?> UnicodeOverride = new();
+
+    public static bool UnicodeEnabled => UnicodeOverride.Value ?? !ShouldUseAscii();
+
+    // Isolate explicit rendering modes to the current execution context.
+    internal static IDisposable UseUnicode(bool enabled)
+    {
+        var scope = new GlyphScope(UnicodeOverride.Value);
+        UnicodeOverride.Value = enabled;
+        return scope;
+    }
+
+    private sealed class GlyphScope(bool? previous) : IDisposable
+    {
+        public void Dispose() => UnicodeOverride.Value = previous;
+    }
 
     public static string TopLeft => UnicodeEnabled ? "╭" : "+";
     public static string TopRight => UnicodeEnabled ? "╮" : "+";

@@ -6,9 +6,12 @@ namespace Auxim.Agent.Tests;
 
 public sealed class ComposerLayoutTests
 {
-    [Fact]
-    public void StandardComposerHasBorderedInputAndSeparateHintLayer()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void StandardComposerHasBorderedInputAndSeparateHintLayer(bool unicode)
     {
+        using var glyphs = TerminalGlyphs.UseUnicode(unicode);
         var layout = ScreenLayout.Create(80, 24);
         Assert.Equal(5, layout.ComposerHeight);
         Assert.Equal(20, layout.ComposerTop);
@@ -22,13 +25,14 @@ public sealed class ComposerLayoutTests
         Assert.Equal(3, layout.ComposerLeft);
         using var writer = new StringWriter();
         ConsoleTheme.WriteComposer(writer, layout, false, ConsoleTheme.IdleHint);
-        var frame = writer.ToString();
+        var frame = TerminalFrame.WithoutStyles(writer.ToString());
         Assert.Contains("Message Auxim...", frame);
         Assert.Contains("/ Commands", frame);
         Assert.Contains("Enter Send", frame);
-        Assert.Contains($"\u001b[20;3H╭{new string('─', 73)}╮", frame);
-        Assert.Contains($"\u001b[24;3H╰{new string('─', 73)}╯", frame);
-        Assert.Contains($"\u001b[22;3H│{new string('─', 73)}│", frame);
+        var line = new string(unicode ? '─' : '-', 73);
+        Assert.Contains(unicode ? $"\u001b[20;3H╭{line}╮" : $"\u001b[20;3H+{line}+", frame);
+        Assert.Contains(unicode ? $"\u001b[24;3H╰{line}╯" : $"\u001b[24;3H+{line}+", frame);
+        Assert.Contains(unicode ? $"\u001b[22;3H│{line}│" : $"\u001b[22;3H|{line}|", frame);
         Assert.EndsWith("\u001b[21;8H", frame, StringComparison.Ordinal);
         AssertAllErasesInsideComposer(frame, layout);
     }
@@ -58,22 +62,25 @@ public sealed class ComposerLayoutTests
         AssertAllErasesInsideComposer(writer.ToString(), layout);
     }
 
-    [Fact]
-    public void PlaceholderNeverBecomesDraftAndCursorStaysAtInsertionPoint()
+    [Theory]
+    [InlineData(false, "  > ")]
+    [InlineData(true, "  › ")]
+    public void PlaceholderNeverBecomesDraftAndCursorStaysAtInsertionPoint(bool unicode, string expectedPrompt)
     {
+        using var glyphs = TerminalGlyphs.UseUnicode(unicode);
         var layout = ScreenLayout.Create(80, 24);
         var row = InputRow.Create(ConsoleTheme.ComposerPrompt(layout.ComposerWidth), "", 0, layout.InputColumns);
         var original = row.Text;
         using var writer = new StringWriter();
         row.Write(writer, layout, placeholder: true);
-        Assert.Contains("  ›  Message Auxim...", writer.ToString());
+        Assert.Contains(expectedPrompt + " Message Auxim...", TerminalFrame.WithoutStyles(writer.ToString()));
         Assert.Equal(original, row.Text);
         Assert.DoesNotContain("Message", row.Text);
         Assert.Equal(4, row.CursorColumn);
         Assert.EndsWith("\u001b[21;8H", writer.ToString(), StringComparison.Ordinal);
         writer.GetStringBuilder().Clear();
         InputRow.Create(ConsoleTheme.ComposerPrompt(layout.ComposerWidth), "Test", 4, layout.InputColumns).Write(writer, layout);
-        Assert.Contains("  › Test", writer.ToString());
+        Assert.Contains(expectedPrompt + "Test", TerminalFrame.WithoutStyles(writer.ToString()));
         Assert.DoesNotContain("Message Auxim", writer.ToString());
         Assert.EndsWith("\u001b[21;12H", writer.ToString(), StringComparison.Ordinal);
     }
@@ -110,13 +117,16 @@ public sealed class ComposerLayoutTests
         Assert.EndsWith(draft, recovered.Text, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void SuggestionsAndStatusOnlyPaintTheInternalHintRow()
+    [Theory]
+    [InlineData(false, '|')]
+    [InlineData(true, '│')]
+    public void SuggestionsAndStatusOnlyPaintTheInternalHintRow(bool unicode, char border)
     {
+        using var glyphs = TerminalGlyphs.UseUnicode(unicode);
         var layout = ScreenLayout.Create(80, 24);
         using var writer = new StringWriter();
         ConsoleTheme.WriteComposerHint(writer, layout, "/help  /history  /model");
-        Assert.Contains("\u001b[23;3H│  /help", writer.ToString());
+        Assert.Contains($"\u001b[23;3H{border}  /help", TerminalFrame.WithoutStyles(writer.ToString()));
         Assert.Single(Regex.Matches(writer.ToString(), "\\[23;3H"));
         AssertAllErasesInsideComposer(writer.ToString(), layout);
     }

@@ -97,12 +97,39 @@ public sealed class VisualThemeTests
     }
 
     [Theory]
-    [InlineData("中文", 1, ".")]
-    [InlineData("🙂🙂", 3, "🙂…")]
-    [InlineData("e\u0301文", 2, "e\u0301.")]
-    public void SummariesNeverSplitGraphemes(string text, int width, string expected)
+    [InlineData(false, "中文", 1, ".")]
+    [InlineData(false, "🙂🙂", 3, "...")]
+    [InlineData(false, "e\u0301文", 2, "e\u0301.")]
+    [InlineData(true, "中文", 1, ".")]
+    [InlineData(true, "🙂🙂", 3, "🙂…")]
+    [InlineData(true, "e\u0301文", 2, "e\u0301.")]
+    public void SummariesNeverSplitGraphemes(bool unicode, string text, int width, string expected)
     {
-        if (width == 3 && !TerminalGlyphs.UnicodeEnabled) expected = "...";
+        using var glyphs = TerminalGlyphs.UseUnicode(unicode);
         Assert.Equal(expected, ConsoleTheme.Summarize(text, width));
+    }
+
+    [Fact]
+    public async Task GlyphModesStayIsolatedAcrossOverlappingExecutionContexts()
+    {
+        using var glyphs = TerminalGlyphs.UseUnicode(false);
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var unicode = Task.Run(async () =>
+        {
+            using (TerminalGlyphs.UseUnicode(true))
+            {
+                ready.SetResult();
+                await release.Task;
+                Assert.Equal("╭", TerminalGlyphs.TopLeft);
+            }
+            Assert.Equal("+", TerminalGlyphs.TopLeft);
+        });
+
+        await ready.Task;
+        var parentGlyph = TerminalGlyphs.TopLeft;
+        release.SetResult();
+        await unicode;
+        Assert.Equal("+", parentGlyph);
     }
 }
