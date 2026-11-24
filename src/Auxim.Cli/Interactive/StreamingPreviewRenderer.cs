@@ -2,7 +2,7 @@ using System.Text;
 
 namespace Auxim.Cli.Interactive;
 
-internal enum PreviewOutputMode { Alternate, Inline, Redirected }
+internal enum PreviewOutputMode { Workspace, Inline, Redirected }
 
 // Paints only visible physical rows. The view owns the transcript; this class
 // retains just the last screen frame and an optional bounded inline region.
@@ -12,9 +12,6 @@ internal sealed class StreamingPreviewRenderer(
     PreviewOutputMode mode,
     Func<(int Width, int Height)> size,
     StreamingTranscript transcript,
-    Func<ScreenLayout>? prepareLayout = null,
-    Action? suspendLayout = null,
-    Action? resumeLayout = null,
     Action<string>? appendWorkspace = null,
     Action? refreshWorkspace = null)
 {
@@ -27,7 +24,6 @@ internal sealed class StreamingPreviewRenderer(
     private bool _hadText;
     private bool _invalidated;
     private bool _uncertain;
-    private ScreenLayout _layout;
 
     public void Append(string text)
     {
@@ -49,15 +45,13 @@ internal sealed class StreamingPreviewRenderer(
     public void Refresh()
     {
         if (_suspended || mode == PreviewOutputMode.Redirected) return;
-        if (refreshWorkspace is not null)
+        if (mode == PreviewOutputMode.Workspace)
         {
-            refreshWorkspace();
+            refreshWorkspace!();
             return;
         }
+
         var dimensions = size();
-        var previousLayout = _layout;
-        if (mode == PreviewOutputMode.Alternate)
-            _layout = prepareLayout?.Invoke() ?? ScreenLayout.Create(dimensions.Width, dimensions.Height);
         if (!transcript.HasContent) return;
         if (dimensions.Width < 2 || dimensions.Height < 3)
         {
@@ -66,56 +60,28 @@ internal sealed class StreamingPreviewRenderer(
             _lastSize = dimensions;
             return;
         }
-        var geometryChanged = dimensions != _lastSize || mode == PreviewOutputMode.Alternate && previousLayout != _layout;
+        var geometryChanged = dimensions != _lastSize;
         if (!transcript.IsDirty && !geometryChanged && !_invalidated) return;
         var columns = ConsoleTheme.ReadableWidth(dimensions.Width - 1); // never trigger terminal auto-wrap
-        var capacity = mode == PreviewOutputMode.Alternate ? _layout.ContentHeight : Math.Max(1, dimensions.Height - 2);
-        if (capacity == 0)
-        {
-            _previous = [];
-            _initialized = false;
-            _lastSize = dimensions;
-            return;
-        }
-        if (mode == PreviewOutputMode.Inline) capacity = Math.Min(6, capacity);
+        var capacity = Math.Min(6, dimensions.Height - 2);
         transcript.Prepare(columns, capacity);
         var rows = transcript.Viewport.GetVisibleLines(capacity).ToArray();
         var frame = new StringBuilder();
 
-        if (mode == PreviewOutputMode.Alternate)
+        if (!_initialized || geometryChanged || _invalidated)
         {
-            if (!_initialized || geometryChanged || _invalidated)
-            {
-                for (var i = 0; i < capacity; i++)
-                    frame.Append($"\u001b[{_layout.ContentTop + i};1H\u001b[2K");
-                _previous = [];
-            }
-            for (var i = 0; i < Math.Min(capacity, Math.Max(rows.Length, _previous.Length)); i++)
-            {
-                var line = i < rows.Length ? rows[i] : "";
-                if (i < _previous.Length && _previous[i] == line) continue;
-                frame.Append($"\u001b[{_layout.ContentTop + i};1H\u001b[2K{ConsoleTheme.StreamingRow(line)}");
-            }
-            if (frame.Length > 0) frame.Append($"\u001b[{_layout.InputRow};{_layout.InputStartColumn}H");
+            // Resize invalidates coordinates in native scrollback.
+            if (_initialized && geometryChanged) frame.Append("\u001b[2J\u001b[H");
+            _regionHeight = capacity;
+            frame.Append('\r').Append('\n', _regionHeight);
+            _previous = [];
         }
-        else
+        for (var i = 0; i < _regionHeight; i++)
         {
-            if (!_initialized || geometryChanged || _invalidated)
-            {
-                // Resize reflow invalidates relative coordinates. Rebuild once,
-                // rather than moving through an unknown native scrollback area.
-                if (_initialized && geometryChanged) frame.Append("\u001b[2J\u001b[H");
-                _regionHeight = capacity;
-                frame.Append('\r').Append('\n', _regionHeight);
-                _previous = [];
-            }
-            for (var i = 0; i < _regionHeight; i++)
-            {
-                var line = i < rows.Length ? rows[i] : "";
-                if (i < _previous.Length && _previous[i] == line) continue;
-                var up = _regionHeight - i;
-                frame.Append($"\u001b[{up}A\r\u001b[2K{ConsoleTheme.StreamingRow(line)}\r\u001b[{up}B");
-            }
+            var line = i < rows.Length ? rows[i] : "";
+            if (i < _previous.Length && _previous[i] == line) continue;
+            var up = _regionHeight - i;
+            frame.Append($"\u001b[{up}A\r\u001b[2K{ConsoleTheme.StreamingRow(line)}\r\u001b[{up}B");
         }
 
         if (frame.Length > 0)
@@ -125,9 +91,7 @@ internal sealed class StreamingPreviewRenderer(
             output.Flush();
             _uncertain = false;
         }
-        _previous = mode == PreviewOutputMode.Inline
-            ? Enumerable.Range(0, _regionHeight).Select(i => i < rows.Length ? rows[i] : "").ToArray()
-            : rows;
+        _previous = Enumerable.Range(0, _regionHeight).Select(i => i < rows.Length ? rows[i] : "").ToArray();
         _lastSize = dimensions;
         _initialized = true;
         _invalidated = false;
@@ -152,37 +116,26 @@ internal sealed class StreamingPreviewRenderer(
 
     public void Suspend()
     {
-        if (mode != PreviewOutputMode.Alternate || suspendLayout is not null)
-            ClearRegion();
+        ClearRegion();
         _suspended = true;
-        suspendLayout?.Invoke();
     }
 
     public void Resume()
     {
-        resumeLayout?.Invoke();
         _suspended = false;
         _invalidated = true;
     }
 
     private void ClearRegion()
     {
-        if (!_initialized) return;
+        if (mode != PreviewOutputMode.Inline || !_initialized) return;
         try
         {
-            if (mode == PreviewOutputMode.Alternate)
-            {
-                var dimensions = size();
-                var current = prepareLayout?.Invoke() ?? ScreenLayout.Create(dimensions.Width, dimensions.Height);
-                for (var i = 0; i < current.ContentHeight; i++)
-                    ScreenLayout.WriteRow(output, current.ContentTop + i, current.Columns, "");
-                output.Write($"\u001b[{current.InputRow};{current.InputStartColumn}H");
-            }
-            else if (_uncertain)
+            if (_uncertain)
             {
                 output.Write("\u001b[2J\u001b[H");
             }
-            else if (mode == PreviewOutputMode.Inline)
+            else
             {
                 for (var i = 0; i < _regionHeight; i++)
                 {

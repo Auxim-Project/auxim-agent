@@ -2,24 +2,26 @@ using System.Globalization;
 using System.Text;
 using Auxim.Cli.Interactive;
 using Auxim.Core.Approval;
+using Auxim.Core.Config;
 using Auxim.Core.Runtime;
 using Xunit;
 
 namespace Auxim.Agent.Tests;
 
-public sealed class MultilinePreviewTests
+public sealed class MultilinePreviewTests : IDisposable
 {
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void GrowingTranscriptFollowsTheBottomWithoutRepeatedScreenClears(bool alternate)
+    private readonly DirectoryInfo _home = Directory.CreateTempSubdirectory("auxim-preview-tests-");
+
+    public void Dispose() => _home.Delete(recursive: true);
+
+    [Fact]
+    public void GrowingTranscriptFollowsTheBottomWithoutRepeatedScreenClears()
     {
-        var mode = alternate ? PreviewOutputMode.Alternate : PreviewOutputMode.Inline;
         using var screen = new Screen(30, 10);
         var viewport = new TranscriptViewport();
         var reads = 0;
         var transcript = new StreamingTranscript(() => { reads++; return ["saved history"]; }, "question", viewport);
-        var renderer = Renderer(screen, mode, transcript);
+        var renderer = Renderer(screen, transcript);
         renderer.Append("first\nsecond");
         Assert.Contains("first", screen.Visible);
         Assert.Contains("second", screen.Visible);
@@ -28,7 +30,7 @@ public sealed class MultilinePreviewTests
 
         Assert.Contains("line 39", screen.Visible);
         Assert.DoesNotContain("line 0\n", screen.Visible);
-        Assert.Equal(viewport.TotalLines - (mode == PreviewOutputMode.Inline ? 6 : ScreenLayout.Create(30, 10).ContentHeight), viewport.Offset);
+        Assert.Equal(viewport.TotalLines - 6, viewport.Offset);
         Assert.Equal(clears, screen.Clears);
         Assert.Equal(1, reads);
         var writes = screen.Writes;
@@ -75,15 +77,12 @@ public sealed class MultilinePreviewTests
         Assert.Equal(["You", "  question", "", "Assistant  streaming", "  e\u0301 👨‍👩‍👧‍👦", "  last 🙂"], transcript.ToArray());
     }
 
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void ResizingWithoutADeltaReflowsOriginalTextAndErasesOldRows(bool alternate)
+    [Fact]
+    public void ResizingWithoutADeltaReflowsOriginalTextAndErasesOldRows()
     {
-        var mode = alternate ? PreviewOutputMode.Alternate : PreviewOutputMode.Inline;
         using var screen = new Screen(40, 12);
         var transcript = new StreamingTranscript(() => ["saved 中文 history"], "prompt", new TranscriptViewport());
-        var renderer = Renderer(screen, mode, transcript);
+        var renderer = Renderer(screen, transcript);
         renderer.Append("a long unbroken message 中文 🙂 with its ending");
         screen.Resize(18, 8);
         renderer.Refresh();
@@ -115,16 +114,12 @@ public sealed class MultilinePreviewTests
         Assert.Equal(["old two", "old three"], viewport.GetVisibleLines(2));
     }
 
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task ToolAndApprovalBoundariesRetainOrderedContentAndRebuildAfterHandoff(bool alternate)
+    [Fact]
+    public async Task ToolAndApprovalBoundariesRetainOrderedContentAndRebuildAfterHandoff()
     {
-        var mode = alternate ? PreviewOutputMode.Alternate : PreviewOutputMode.Inline;
         using var screen = new Screen(80, 22);
         var transcript = new StreamingTranscript(() => [], "prompt", new TranscriptViewport());
-        var renderer = new StreamingPreviewRenderer(screen, screen, mode, () => (screen.Width, screen.Height), transcript,
-            resumeLayout: alternate ? () => screen.Write("\u001b[2J\u001b[H") : null);
+        var renderer = Renderer(screen, transcript);
         await using var preview = new StreamingPreview(renderer, _ => renderer.AddTool("[tool:echo] start"));
         var run = new AuximRunId("test");
         await preview.PublishAsync(Delta("before tool"), default);
@@ -138,6 +133,7 @@ public sealed class MultilinePreviewTests
         await preview.PublishAsync(Delta("after tool"), default);
         await Task.Delay(100);
         Assert.Equal(atApproval, screen.Visible);
+        screen.Write("\u001b[2J\u001b[H");
         await preview.PublishAsync(new RuntimeApprovalResolvedEvent("resolved", DateTimeOffset.UtcNow, run, "request", true, false, ""), default);
         await WaitUntilAsync(() => screen.Visible.Contains("after tool", StringComparison.Ordinal));
         Assert.DoesNotContain("APPROVAL OWNS SCREEN", screen.Visible);
@@ -148,16 +144,13 @@ public sealed class MultilinePreviewTests
         Assert.Equal(1, screen.Visible.Split("formal answer").Length - 1);
     }
 
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task AFailedPaintStillCleansItsRegionAndAllowsTheNextRun(bool alternate)
+    [Fact]
+    public async Task AFailedPaintStillCleansItsRegionAndAllowsTheNextRun()
     {
-        var mode = alternate ? PreviewOutputMode.Alternate : PreviewOutputMode.Inline;
         using var screen = new Screen(60, 12);
         var viewport = new TranscriptViewport();
         var transcript = new StreamingTranscript(() => [], "prompt", viewport);
-        var renderer = Renderer(screen, mode, transcript);
+        var renderer = Renderer(screen, transcript);
         await using (var preview = new StreamingPreview(renderer, _ => { }))
         {
             await preview.PublishAsync(Delta("partial text"), default);
@@ -180,66 +173,130 @@ public sealed class MultilinePreviewTests
     }
 
     [Fact]
-    public void AlternatePreviewNeverErasesHeaderInputOrHintsEvenOnFinish()
+    public async Task WorkspaceHistoryFollowsTheBottomAndKeepsComposerAndCursorIntact()
     {
-        using var screen = new Screen(60, 12);
-        var layout = ScreenLayout.Create(60, 12);
-        ScreenLayout.WriteRow(screen, 1, layout.Columns, "AUXIM HEADER");
-        ScreenLayout.WriteRow(screen, layout.InputRow, layout.Columns, "auxim > [running]");
-        ScreenLayout.WriteRow(screen, layout.HintRow, layout.Columns, "Ctrl+C cancel");
-        var transcript = new StreamingTranscript(() => [], "question", new TranscriptViewport());
-        var renderer = Renderer(screen, PreviewOutputMode.Alternate, transcript);
-        for (var i = 0; i < 40; i++) renderer.Append($"中文 line {i}\n");
-        renderer.AddTool("[tool:echo] completed");
-        renderer.Finish(null);
-        Assert.Contains("AUXIM HEADER", screen.Visible);
-        Assert.Contains("auxim > [running]", screen.Visible);
-        Assert.Contains("Ctrl+C cancel", screen.Visible);
+        using var screen = new Screen(80, 24);
+        var view = Workspace(screen);
+        view.ShowMain();
+        Assert.Equal(4, view.PrepareInputLayout(4)!.Value.InputRows);
+
+        await using var preview = view.BeginStreamingPreview("question");
+        await preview.PublishAsync(Delta("first live text"), default);
+        await WaitUntilAsync(() => screen.Visible.Contains("first live text", StringComparison.Ordinal));
+        await OpenLiveHistory(preview);
+        var erased = screen.ClearedRows.Length;
+        await preview.PublishAsync(Delta(string.Concat(Enumerable.Range(0, 40).Select(i => $"\nbody row {i:00}"))), default);
+        await WaitUntilAsync(() => screen.Visible.Contains("body row 39", StringComparison.Ordinal));
+        var layout = ScreenLayout.Create(80, 24);
+        Assert.DoesNotContain("body row 00", screen.Visible);
+        Assert.Contains("AUXIM / History", screen.Visible);
+        Assert.Contains("Working...", screen.Visible);
+        Assert.Contains("Follow live", screen.Visible);
+        Assert.Equal((layout.InputRow, layout.InputStartColumn), screen.Cursor);
+        Assert.NotEmpty(screen.ClearedRows.Skip(erased));
+        Assert.All(screen.ClearedRows.Skip(erased), row =>
+            Assert.InRange(row, layout.ContentTop, layout.ContentTop + layout.ContentHeight - 1));
+        var writes = screen.Writes;
+        await Task.Delay(100);
+        Assert.Equal(writes, screen.Writes);
+        await preview.FinishAsync();
+        view.EndRun(response: "formal answer");
+        Assert.DoesNotContain("body row 39", screen.Visible);
+        Assert.Equal((layout.InputRow, layout.InputStartColumn), screen.Cursor);
         Assert.Equal(0, screen.Clears);
     }
 
     [Fact]
-    public async Task EmptyPreviewStillObservesResizeAndPausesLayoutDuringApproval()
+    public async Task WorkspaceObservesResizeWithoutADeltaButPausesPaintingDuringApproval()
     {
-        using var screen = new Screen(60, 12);
-        var checks = 0;
-        var suspended = false;
-        var transcript = new StreamingTranscript(() => [], "question", new TranscriptViewport());
-        var renderer = new StreamingPreviewRenderer(screen, screen, PreviewOutputMode.Alternate,
-            () => (screen.Width, screen.Height), transcript,
-            () => { Interlocked.Increment(ref checks); return ScreenLayout.Create(screen.Width, screen.Height); },
-            () => suspended = true, () => suspended = false);
-        await using var preview = new StreamingPreview(renderer, _ => { }, TimeSpan.FromMilliseconds(5));
-        await WaitUntilAsync(() => Volatile.Read(ref checks) > 1);
+        using var screen = new Screen(80, 24);
+        var view = Workspace(screen);
+        await using var preview = view.BeginStreamingPreview("question");
+        screen.Resize(60, 16);
+        await WaitUntilAsync(() => screen.Visible.Contains("Working...", StringComparison.Ordinal));
+        Assert.Equal((ScreenLayout.Create(60, 16).InputRow, ScreenLayout.Create(60, 16).InputStartColumn), screen.Cursor);
+
+        await OpenLiveHistory(preview);
+        await preview.PublishAsync(Delta("before approval"), default);
         var run = new AuximRunId("test");
-        await preview.PublishAsync(new RuntimeApprovalRequestedEvent("request", DateTimeOffset.UtcNow, run,
-            new ApprovalRequest("request", run.Value, "echo", new Dictionary<string, object?>(), [])), default);
-        Assert.True(suspended);
-        var atApproval = Volatile.Read(ref checks);
-        screen.Resize(30, 8);
-        await Task.Delay(50);
-        Assert.Equal(atApproval, Volatile.Read(ref checks));
+        var requested = new RuntimeApprovalRequestedEvent("request", DateTimeOffset.UtcNow, run,
+            new ApprovalRequest("request", run.Value, "echo", new Dictionary<string, object?>(), []));
+        await preview.PublishAsync(requested, default);
+        Assert.Contains("before approval", screen.Visible);
+        view.PaintApproval(["APPROVAL OWNS SCREEN"], ScreenLayout.Create(60, 16), feedback: false, layoutChanged: true);
+        var writes = screen.Writes;
+        screen.Resize(18, 8);
+        await preview.PublishAsync(Delta("after approval 中文🙂"), default);
+        await Task.Delay(100);
+        Assert.Equal(writes, screen.Writes);
+
+        view.EndApprovalPanel();
         await preview.PublishAsync(new RuntimeApprovalResolvedEvent("resolved", DateTimeOffset.UtcNow, run, "request", false, false, "no"), default);
-        Assert.False(suspended);
-        await WaitUntilAsync(() => Volatile.Read(ref checks) > atApproval);
+        await WaitUntilAsync(() => screen.Visible.Contains("中文🙂", StringComparison.Ordinal));
+        Assert.DoesNotContain("APPROVAL OWNS SCREEN", screen.Visible);
+
+        foreach (var (width, height) in new[] { (1, 1), (3, 3), (80, 24) })
+        {
+            var before = screen.Writes;
+            screen.Resize(width, height);
+            var layout = ScreenLayout.Create(width, height);
+            await WaitUntilAsync(() => screen.Writes > before
+                && screen.Cursor == (layout.InputRow, layout.InputStartColumn));
+        }
+        await WaitUntilAsync(() => screen.Visible.Contains("after approval 中文🙂", StringComparison.Ordinal));
         await preview.FinishAsync();
+        view.EndRun();
+        Assert.Equal(0, screen.Clears);
     }
 
-    private static StreamingPreviewRenderer Renderer(Screen screen, PreviewOutputMode mode, StreamingTranscript transcript) =>
-        new(screen, screen, mode, () => (screen.Width, screen.Height), transcript);
+    [Fact]
+    public async Task WorkspaceRecoversFromPaintFailureAndDoesNotReuseItsTemporaryTranscript()
+    {
+        using var screen = new Screen(80, 24);
+        var view = Workspace(screen);
+        await using (var preview = view.BeginStreamingPreview("first question"))
+        {
+            await OpenLiveHistory(preview);
+            await preview.PublishAsync(Delta("partial text"), default);
+            await WaitUntilAsync(() => screen.Visible.Contains("partial text", StringComparison.Ordinal));
+            screen.ThrowOnNextWrite = true;
+            await preview.PublishAsync(Delta(" paint failure"), default);
+            await screen.FailedWrite.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Assert.ThrowsAsync<IOException>(() => preview.FinishAsync());
+            view.EndRun("Failed");
+        }
+        Assert.DoesNotContain("partial text", screen.Visible);
+        await using var next = view.BeginStreamingPreview("new question");
+        await OpenLiveHistory(next);
+        await next.PublishAsync(Delta("fresh content"), default);
+        await WaitUntilAsync(() => screen.Visible.Contains("fresh content", StringComparison.Ordinal));
+        Assert.DoesNotContain("paint failure", screen.Visible);
+        await next.FinishAsync("cancelled");
+        view.EndRun("Cancelled");
+        Assert.DoesNotContain("fresh content", screen.Visible);
+    }
+
+    private InteractiveView Workspace(Screen screen) =>
+        new(new AuximRuntimeService(null!, configLoader: () => new AuximConfig(),
+            homeDirectory: () => _home.FullName), DateTimeOffset.Now,
+            output: screen, size: () => (screen.Width, screen.Height), fixedLayout: true);
+
+    private static async Task OpenLiveHistory(StreamingPreview preview) =>
+        await preview.NavigateAsync(new(TerminalInputEventKind.MouseWheel, default, ScrollDelta: 1));
+
+    private static StreamingPreviewRenderer Renderer(Screen screen, StreamingTranscript transcript) =>
+        new(screen, screen, PreviewOutputMode.Inline, () => (screen.Width, screen.Height), transcript);
 
     [Theory]
-    [InlineData(true, "cancelled")]
-    [InlineData(false, "cancelled")]
-    [InlineData(true, "failed")]
-    [InlineData(false, "failed")]
-    public async Task IncompleteRunRestoresThePreviousViewportAndLeavesNoTemporaryRows(bool alternate, string status)
+    [InlineData("cancelled")]
+    [InlineData("failed")]
+    public async Task IncompleteRunRestoresThePreviousViewportAndLeavesNoTemporaryRows(string status)
     {
         using var screen = new Screen(60, 12);
         var viewport = new TranscriptViewport();
         viewport.Open(["saved one", "saved two", "saved three"], true, 2);
         var transcript = new StreamingTranscript(() => ["saved history"], "prompt", viewport);
-        var renderer = Renderer(screen, alternate ? PreviewOutputMode.Alternate : PreviewOutputMode.Inline, transcript);
+        var renderer = Renderer(screen, transcript);
         await using (var preview = new StreamingPreview(renderer, _ => { }))
         {
             await preview.PublishAsync(Delta("partial one\npartial two"), default);
@@ -272,12 +329,15 @@ public sealed class MultilinePreviewTests
     private sealed class Screen(int width, int height) : TextWriter
     {
         private readonly object _gate = new();
+        private readonly List<int> _clearedRows = [];
         private string?[,] _cells = new string?[height, width];
         private int _row, _column;
         public int Width { get; private set; } = width;
         public int Height { get; private set; } = height;
         public int Clears { get; private set; }
         public int Writes { get; private set; }
+        public int[] ClearedRows { get { lock (_gate) return _clearedRows.ToArray(); } }
+        public (int Row, int Column) Cursor { get { lock (_gate) return (_row + 1, _column + 1); } }
         public bool ThrowOnNextWrite { get; set; }
         public TaskCompletionSource FailedWrite { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public override Encoding Encoding => Encoding.UTF8;
@@ -325,7 +385,10 @@ public sealed class MultilinePreviewTests
                             case 'H': _row = Math.Clamp(n - 1, 0, Height - 1); _column = Math.Clamp((numbers.Length > 1 ? numbers[1] : 1) - 1, 0, Width - 1); break;
                             case 'A': _row = Math.Max(0, _row - n); break;
                             case 'B': _row = Math.Min(Height - 1, _row + n); break;
-                            case 'K': for (var c = n == 2 ? 0 : _column; c < Width; c++) _cells[_row, c] = null; break;
+                            case 'K':
+                                _clearedRows.Add(_row + 1);
+                                for (var c = n == 2 ? 0 : _column; c < Width; c++) _cells[_row, c] = null;
+                                break;
                             case 'J': _cells = new string?[Height, Width]; Clears++; break;
                         }
                         i = end + 1;

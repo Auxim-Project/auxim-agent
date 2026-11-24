@@ -8,11 +8,8 @@ internal static class TerminalGlyphs
     public static string TopRight => UnicodeEnabled ? "╮" : "+";
     public static string BottomLeft => UnicodeEnabled ? "╰" : "+";
     public static string BottomRight => UnicodeEnabled ? "╯" : "+";
-    public static string TeeLeft => UnicodeEnabled ? "├" : "+";
-    public static string TeeRight => UnicodeEnabled ? "┤" : "+";
     public static string Horizontal => UnicodeEnabled ? "─" : "-";
     public static string Vertical => UnicodeEnabled ? "│" : "|";
-    public static string Section => UnicodeEnabled ? "▌" : "|";
     public static string Ellipsis => UnicodeEnabled ? "…" : "...";
 
     public static string HorizontalLine(int width) => new(Horizontal[0], Math.Max(0, width));

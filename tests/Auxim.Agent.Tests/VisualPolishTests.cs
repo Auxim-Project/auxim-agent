@@ -21,7 +21,7 @@ public sealed class VisualPolishTests
         Assert.Equal(layout.ComposerInnerWidth - layout.InputRightPadding, layout.InputColumns);
         var draft = string.Concat(Enumerable.Repeat("中文 👨‍👩‍👧‍👦e\u0301 long text ", 30));
         var row = InputRow.Create(ConsoleTheme.ComposerPrompt(layout.ComposerWidth), draft, draft.Length, layout.InputColumns);
-        Assert.True(ConsoleTheme.CellWidth(row.Text) <= layout.InputColumns);
+        Assert.True(TerminalTextLayout.Measure(row.Text) <= layout.InputColumns);
         using var writer = new StringWriter();
         row.Write(writer, layout);
         Assert.StartsWith($"\u001b[{layout.InputRow};{expectedLeft}H", writer.ToString(), StringComparison.Ordinal);

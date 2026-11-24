@@ -24,7 +24,7 @@ public sealed class SurfaceConsistencyTests
         {
             Assert.InRange(int.Parse(row.Groups[1].Value), layout.ComposerTop, layout.ComposerTop + layout.ComposerHeight - 1);
             Assert.Equal(layout.ComposerLeft, int.Parse(row.Groups[2].Value));
-            Assert.Equal(layout.ComposerWidth, ConsoleTheme.CellWidth(row.Groups[3].Value));
+            Assert.Equal(layout.ComposerWidth, TerminalTextLayout.Measure(row.Groups[3].Value));
         }
         Assert.EndsWith($"\u001b[{layout.InputRow};{layout.InputStartColumn}H", frame, StringComparison.Ordinal);
     }
@@ -57,8 +57,8 @@ public sealed class SurfaceConsistencyTests
         var footer = ConsoleTheme.AlignToComposer(ConsoleTheme.DashboardStatus("local/placeholder", "Workspace", 2, layout.ComposerWidth), layout);
         Assert.Equal(layout.ComposerLeft - 1, TerminalTextLayout.Plain(header).IndexOf('◇'));
         Assert.Equal(layout.ComposerLeft - 1, TerminalTextLayout.Plain(rule).IndexOf('─'));
-        Assert.Equal(layout.ComposerLeft + layout.ComposerWidth - 1, ConsoleTheme.CellWidth(header));
-        Assert.Equal(layout.ComposerLeft + layout.ComposerWidth - 1, ConsoleTheme.CellWidth(rule));
+        Assert.Equal(layout.ComposerLeft + layout.ComposerWidth - 1, TerminalTextLayout.Measure(header));
+        Assert.Equal(layout.ComposerLeft + layout.ComposerWidth - 1, TerminalTextLayout.Measure(rule));
         Assert.Equal(layout.ComposerLeft + 1, TerminalTextLayout.Plain(footer).IndexOf("Model", StringComparison.Ordinal));
     }
 }

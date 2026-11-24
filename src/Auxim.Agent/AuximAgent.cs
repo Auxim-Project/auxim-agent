@@ -41,6 +41,7 @@ public sealed class AuximAgent
         IReadOnlyList<AgentMessage>? history = null,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var messages = new List<AgentMessage>
         {
             new("system", BuildSystemPrompt()),
@@ -59,10 +60,12 @@ public sealed class AuximAgent
         }
         else
         {
+            cancellationToken.ThrowIfCancellationRequested();
             response = await _client.CompleteAsync(messages, cancellationToken);
             messages.Add(new AgentMessage("assistant", response));
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         return new AgentResult(response, messages);
     }
 
@@ -86,7 +89,9 @@ public sealed class AuximAgent
         var tools = _tools.List().ToArray();
         for (var iteration = 0; iteration < _options.MaxIterations; iteration++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var completion = await CompleteWithToolsAsync(client, messages, tools, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
             if (!completion.HasToolCalls)
             {
                 messages.Add(new AgentMessage("assistant", completion.Content));
@@ -102,6 +107,7 @@ public sealed class AuximAgent
             foreach (var call in completion.ToolCalls)
             {
                 var result = await InvokeToolCallAsync(call, cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
                 messages.Add(new AgentMessage("tool", result.Content)
                 {
                     Name = call.Name,
@@ -122,6 +128,7 @@ public sealed class AuximAgent
             }
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
         throw new InvalidOperationException($"Tool-calling loop exceeded {_options.MaxIterations} iterations.");
     }
 
@@ -151,10 +158,12 @@ public sealed class AuximAgent
 
     private async Task<ToolInvocationResult> InvokeToolCallAsync(ToolCallRequest call, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         try
         {
             var args = ParseArguments(call.ArgumentsJson);
             var toolName = ResolveToolName(call.Name);
+            cancellationToken.ThrowIfCancellationRequested();
             var content = await _runtimeTools.InvokeAsync(
                 _options.RunId,
                 call.Id,
@@ -165,6 +174,10 @@ public sealed class AuximAgent
                 _eventSink,
                 cancellationToken);
             return ToolInvocationResult.Allowed(toolName, content);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (ToolApprovalDeniedException exception)
         {

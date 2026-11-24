@@ -23,8 +23,47 @@ internal static class TerminalTextLayout
             return 2;
         }
 
-        return LineEditor.DisplayWidth(element);
+        return runes.Sum(RuneWidth);
     }
+
+    public static int Measure(string text)
+    {
+        var width = 0;
+        var max = 0;
+        var elements = StringInfo.GetTextElementEnumerator(Plain(text));
+        while (elements.MoveNext())
+        {
+            var element = elements.GetTextElement();
+            if (element is "\r\n" or "\r" or "\n")
+            {
+                max = Math.Max(max, width);
+                width = 0;
+            }
+            else width += element == "\t" ? 4 - width % 4 : CellWidth(element);
+        }
+        return Math.Max(max, width);
+    }
+
+    public static string TakeCells(string text, int columns)
+    {
+        var output = new StringBuilder();
+        var used = 0;
+        var elements = StringInfo.GetTextElementEnumerator(Plain(text));
+        while (elements.MoveNext())
+        {
+            var element = elements.GetTextElement();
+            if (element is "\r\n" or "\r" or "\n" || element.Length == 1 && char.IsSurrogate(element[0])) break;
+            var width = element == "\t" ? 4 - used % 4 : CellWidth(element);
+            if (used + width > columns) break;
+            if (element == "\t") output.Append(' ', width);
+            else output.Append(element);
+            used += width;
+        }
+        return output.ToString();
+    }
+
+    public static string Pad(string text, int columns) =>
+        text + new string(' ', Math.Max(0, columns - Measure(text)));
 
     // Keeps source indices intact: display substitutions and soft wraps never
     // enter the draft. Reserve one cell so an end-of-row caret cannot auto-wrap.
@@ -32,8 +71,8 @@ internal static class TerminalTextLayout
     {
         if (columns <= 0) return new([new InputVisualRow(0, text.Length, "")], 0, 0);
         prompt = Plain(prompt);
-        if (ConsoleTheme.CellWidth(prompt) + 2 > columns) prompt = columns >= 3 ? "> " : "";
-        var prefix = ConsoleTheme.CellWidth(prompt);
+        if (TerminalTextLayout.Measure(prompt) + 2 > columns) prompt = columns >= 3 ? "> " : "";
+        var prefix = TerminalTextLayout.Measure(prompt);
         var budget = Math.Max(0, columns - prefix - 1);
         if (budget == 0) return new([new InputVisualRow(0, text.Length, prompt)], 0, Math.Min(prefix, columns - 1));
         cursor = Math.Clamp(cursor, 0, text.Length);
@@ -213,6 +252,69 @@ internal static class TerminalTextLayout
         rows.Add(row + (style.Length == 0 ? "" : "\u001b[0m"));
         return rows;
     }
+
+    private static int RuneWidth(Rune rune)
+    {
+        var category = Rune.GetUnicodeCategory(rune);
+        if (category is UnicodeCategory.NonSpacingMark
+            or UnicodeCategory.EnclosingMark
+            or UnicodeCategory.Format
+            or UnicodeCategory.Control)
+        {
+            return 0;
+        }
+
+        return IsWide(rune.Value) ? 2 : 1;
+    }
+
+    private static bool IsWide(int value)
+    {
+        return value is >= 0x1100 and <= 0x115f
+            or >= 0x231a and <= 0x231b
+            or >= 0x2329 and <= 0x232a
+            or >= 0x23e9 and <= 0x23ec
+            or >= 0x23f0 and <= 0x23f0
+            or >= 0x23f3 and <= 0x23f3
+            or >= 0x25fd and <= 0x25fe
+            or >= 0x2614 and <= 0x2615
+            or >= 0x2648 and <= 0x2653
+            or >= 0x267f and <= 0x267f
+            or >= 0x2693 and <= 0x2693
+            or >= 0x26a1 and <= 0x26a1
+            or >= 0x26aa and <= 0x26ab
+            or >= 0x26bd and <= 0x26be
+            or >= 0x26c4 and <= 0x26c5
+            or >= 0x26ce and <= 0x26ce
+            or >= 0x26d4 and <= 0x26d4
+            or >= 0x26ea and <= 0x26ea
+            or >= 0x26f2 and <= 0x26f3
+            or >= 0x26f5 and <= 0x26f5
+            or >= 0x26fa and <= 0x26fa
+            or >= 0x26fd and <= 0x26fd
+            or >= 0x2705 and <= 0x2705
+            or >= 0x270a and <= 0x270b
+            or >= 0x2728 and <= 0x2728
+            or >= 0x274c and <= 0x274c
+            or >= 0x274e and <= 0x274e
+            or >= 0x2753 and <= 0x2755
+            or >= 0x2757 and <= 0x2757
+            or >= 0x2795 and <= 0x2797
+            or >= 0x27b0 and <= 0x27b0
+            or >= 0x27bf and <= 0x27bf
+            or >= 0x2b1b and <= 0x2b1c
+            or >= 0x2b50 and <= 0x2b50
+            or >= 0x2b55 and <= 0x2b55
+            or >= 0x2e80 and <= 0xa4cf
+            or >= 0xac00 and <= 0xd7a3
+            or >= 0xf900 and <= 0xfaff
+            or >= 0xfe10 and <= 0xfe19
+            or >= 0xfe30 and <= 0xfe6f
+            or >= 0xff00 and <= 0xff60
+            or >= 0xffe0 and <= 0xffe6
+            or >= 0x1f300 and <= 0x1f64f
+            or >= 0x1f900 and <= 0x1f9ff
+            or >= 0x20000 and <= 0x3fffd;
+    }
 }
 
 internal sealed record InputVisualRow(int StartUtf16, int EndUtf16, string Text);
@@ -228,7 +330,7 @@ internal sealed record InputProjection(IReadOnlyList<InputVisualRow> Rows, int C
         var selected = Spans.Where(span => span.Row == row && span.Start < end && span.End > start && span.Width > 0).ToArray();
         if (selected.Length == 0) return text;
         // A selected explicit newline gets one visible cell at the row end.
-        var width = ConsoleTheme.CellWidth(text);
+        var width = TerminalTextLayout.Measure(text);
         if (selected.Any(span => span.Column >= width)) text += " ";
         var output = new StringBuilder(); var column = 0; var active = false;
         var elements = StringInfo.GetTextElementEnumerator(text);

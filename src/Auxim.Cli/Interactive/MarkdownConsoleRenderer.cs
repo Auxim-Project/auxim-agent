@@ -2,14 +2,6 @@ namespace Auxim.Cli.Interactive;
 
 internal static class MarkdownConsoleRenderer
 {
-    public static void Render(string markdown)
-    {
-        foreach (var line in RenderToLines(markdown))
-        {
-            Console.WriteLine(line);
-        }
-    }
-
     public static IReadOnlyList<string> RenderToLines(string markdown) =>
         RenderTranscript(markdown).Select(line => line.Display).ToArray();
 

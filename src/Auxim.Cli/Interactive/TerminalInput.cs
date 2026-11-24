@@ -38,6 +38,7 @@ internal static class TerminalInput
     private static readonly object Sync = new();
     private static ITerminalInputBackend? _input;
     private static bool _initialized;
+    private static bool _shuttingDown;
     private static bool _approval;
     private static int _suspended;
     private static int _pasteReaders;
@@ -54,13 +55,13 @@ internal static class TerminalInput
 
     static TerminalInput()
     {
-        AppDomain.CurrentDomain.ProcessExit += (_, _) => Restore();
+        AppDomain.CurrentDomain.ProcessExit += (_, _) => Restore(shuttingDown: true);
         if (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux())
             foreach (var signal in new[] { PosixSignal.SIGINT, PosixSignal.SIGTERM, PosixSignal.SIGHUP })
                 Signals.Add(PosixSignalRegistration.Create(signal, _ =>
                 {
                     if (signal == PosixSignal.SIGINT && InteractiveInterrupt.Current is not null) return;
-                    Restore();
+                    Restore(shuttingDown: true);
                 }));
     }
 
@@ -79,6 +80,7 @@ internal static class TerminalInput
         {
             lock (Sync)
             {
+                if (_shuttingDown) return false;
                 Initialize();
                 if (_input is null) return Console.KeyAvailable;
                 if (_suspended > 0 && !_approval) throw new InvalidOperationException("Foreground command owns terminal input.");
@@ -107,6 +109,7 @@ internal static class TerminalInput
     {
         lock (Sync)
         {
+            if (_shuttingDown) return null;
             Initialize();
             if (_suspended > 0 && !_approval) throw new InvalidOperationException("Foreground command owns terminal input.");
             if (_approval && policy != TerminalInputPolicy.Approval && policy != TerminalInputPolicy.Feedback)
@@ -193,7 +196,7 @@ internal static class TerminalInput
         List<TerminalInputEvent>? navigation = null;
         lock (Sync)
         {
-            if (_approval || _suspended > 0 || _input is null) return [];
+            if (_shuttingDown || _approval || _suspended > 0 || _input is null) return [];
             if (_input.ReadAvailable()) _lastBytesAt = Environment.TickCount64;
             if (readNavigation) ReleaseIdleEditorEscape();
             while (_input.Decoder.HasEvents)
@@ -257,14 +260,15 @@ internal static class TerminalInput
     {
         lock (Sync)
         {
-            if (!_approval && _suspended == 0) _input?.SetCtrlCInput(enabled);
+            if (!_shuttingDown && !_approval && _suspended == 0) _input?.SetCtrlCInput(enabled);
         }
     }
 
     public static void SetNativeMouseInput(TerminalMouseMode mode)
     {
         if (!OperatingSystem.IsWindows()) return;
-        lock (Sync) _input?.SetMouseInput(mode);
+        lock (Sync)
+            if (!_shuttingDown) _input?.SetMouseInput(mode);
     }
 
     public static void DiscardHistoryWheel()
@@ -302,6 +306,7 @@ internal static class TerminalInput
     {
         lock (Sync)
         {
+            if (_shuttingDown) return null;
             Initialize();
             if (_input is not PosixTerminalInput || !Ansi.ControlSequencesEnabled) return null;
             if (_approval || _suspended > 0) throw new InvalidOperationException("Another foreground owner holds input.");
@@ -315,7 +320,7 @@ internal static class TerminalInput
                 {
                     _pasteReaders--;
                     _input.Decoder.DiscardPastePayload();
-                    _input.SetPasteMode(_approval || _pasteReaders > 0 && _suspended == 0);
+                    if (!_shuttingDown) _input.SetPasteMode(_approval || _pasteReaders > 0 && _suspended == 0);
                 }
             });
         }
@@ -326,6 +331,7 @@ internal static class TerminalInput
         lock (Sync)
         {
             failure = null;
+            if (_shuttingDown) { failure = "Terminal is closing; approval was denied safely."; return null; }
             Initialize();
             if (!(_input is PosixTerminalInput)) { failure = "Raw terminal input is unavailable; approval was denied safely."; return null; }
             if (_approval) { failure = "Another approval owns terminal input."; return null; }
@@ -348,9 +354,12 @@ internal static class TerminalInput
                     finally
                     {
                         _approval = false;
-                        _input.SetPasteMode(_pasteReaders > 0 && _suspended == 0);
-                        if (_suspended > 0) _input.Suspend();
-                        else if (_input.KeyboardRequested) _input.EnableKeyboard(InteractiveScreen.IsAlternateScreenActive);
+                        if (!_shuttingDown)
+                        {
+                            _input.SetPasteMode(_pasteReaders > 0 && _suspended == 0);
+                            if (_suspended > 0) _input.Suspend();
+                            else if (_input.KeyboardRequested) _input.EnableKeyboard(InteractiveScreen.IsAlternateScreenActive);
+                        }
                     }
                 }
             });
@@ -370,7 +379,7 @@ internal static class TerminalInput
         {
             lock (Sync)
             {
-                if (--_suspended != 0 || _input is null) return;
+                if (--_suspended != 0 || _shuttingDown || _input is null) return;
                 _input.Activate();
                 _input.DiscardPending();
                 _input.SetPasteMode(_pasteReaders > 0);
@@ -379,10 +388,13 @@ internal static class TerminalInput
         });
     }
 
-    public static void Restore()
+    public static void Restore(bool shuttingDown = false)
     {
         lock (Sync)
         {
+            // A signal can arrive while the editor is between input polls. Do not
+            // let that editor re-enter raw mode after final terminal cleanup.
+            _shuttingDown |= shuttingDown;
             try { _input?.Suspend(); }
             catch (Exception error) when (error is IOException or ObjectDisposedException) { }
         }

@@ -135,7 +135,7 @@ internal sealed partial class InteractiveView
             _copy = null;
             var result = pending.IsCompletedSuccessfully ? pending.Result : new(false, "Clipboard unavailable.");
             if (pending.IsFaulted) _ = pending.Exception;
-            if (result.TerminalSequence is { } sequence && CanCopyHistory) Console.Out.Write(sequence);
+            if (result.TerminalSequence is { } sequence && CanCopyHistory) Output.Write(sequence);
             _copyStatus = result.Status;
             changed = true;
         }
@@ -168,11 +168,11 @@ internal sealed partial class InteractiveView
         SyncHistoryCopyControl();
         ApplyMousePolicy();
         if (_running || _layout is not { } layout) return;
-        Console.Out.Write("\u001b7");
+        Output.Write("\u001b7");
         DrawFixedContent();
-        ConsoleTheme.WriteComposerHint(Console.Out, layout, HistorySelectionHint(_notice));
-        Console.Out.Write("\u001b8");
-        Console.Out.Flush();
+        ConsoleTheme.WriteComposerHint(Output, layout, HistorySelectionHint(_notice));
+        Output.Write("\u001b8");
+        Output.Flush();
     }
 
     private IReadOnlyList<string> PaintHistoryRows(TranscriptViewport viewport, ScreenLayout layout, bool live)

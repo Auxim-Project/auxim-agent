@@ -68,35 +68,6 @@ public sealed class ScreenLayoutTests
             Assert.InRange(int.Parse(match.Groups[2].Value), 1, layout.Width);
         }
     }
-
-    [Fact]
-    public void ResizingAndFinishingPreviewOnlyEraseTheCurrentContentRegion()
-    {
-        using var output = new StringWriter();
-        var dimensions = (Width: 80, Height: 24);
-        var transcript = new StreamingTranscript(() => [], "question", new TranscriptViewport());
-        var renderer = new StreamingPreviewRenderer(output, output, PreviewOutputMode.Alternate, () => dimensions, transcript);
-        foreach (var size in new[] { (80, 24), (20, 8), (1, 1), (3, 3), (80, 24) })
-        {
-            output.GetStringBuilder().Clear();
-            dimensions = size;
-            renderer.Append("中文 preview\n");
-            var layout = ScreenLayout.Create(size.Item1, size.Item2);
-            AssertBoundedErase(output.ToString(), layout);
-        }
-        output.GetStringBuilder().Clear();
-        renderer.Finish("failed");
-        AssertBoundedErase(output.ToString(), ScreenLayout.Create(80, 24));
-    }
-
-    private static void AssertBoundedErase(string output, ScreenLayout layout)
-    {
-        Assert.DoesNotContain("\u001b[2J", output);
-        Assert.DoesNotContain("\u001b[0J", output);
-        foreach (Match match in Regex.Matches(output, "\u001b\\[(\\d+);1H\u001b\\[2K"))
-            Assert.InRange(int.Parse(match.Groups[1].Value), layout.ContentTop, layout.ContentTop + layout.ContentHeight - 1);
-    }
-
     private static IEnumerable<string> Elements(string text) =>
         StringInfo.ParseCombiningCharacters(text).Select(i => StringInfo.GetNextTextElement(text, i));
 }

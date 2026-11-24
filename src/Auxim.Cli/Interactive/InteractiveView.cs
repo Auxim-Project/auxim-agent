@@ -5,9 +5,11 @@ namespace Auxim.Cli.Interactive;
 
 // Owns session presentation and view transitions; terminal/input lifecycles stay
 // in InteractiveScreen and LineEditor, and command execution stays in the shell.
-internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOffset startedAt, IClipboard? clipboard = null)
+internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOffset startedAt, IClipboard? clipboard = null,
+    TextWriter? output = null, Func<(int Width, int Height)>? size = null, bool? fixedLayout = null)
 {
     private readonly IAuximRuntime _runtime = runtime;
+    private TextWriter Output => output ?? Console.Out;
     private readonly IClipboard _clipboard = clipboard ?? new Clipboard();
     private readonly DateTimeOffset _startedAt = startedAt;
     private readonly TranscriptViewport _transcript = new();
@@ -98,10 +100,10 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
         {
             // Preserve the editor cursor. Do not repaint History or Composer
             // text on a mouse-mode switch.
-            Console.Out.Write("\u001b7");
-            ConsoleTheme.WriteComposerHint(Console.Out, layout, _notice);
-            Console.Out.Write("\u001b8");
-            Console.Out.Flush();
+            Output.Write("\u001b7");
+            ConsoleTheme.WriteComposerHint(Output, layout, _notice);
+            Output.Write("\u001b8");
+            Output.Flush();
         }
         else ConsoleTheme.Hint(_notice);
         return true;
@@ -111,7 +113,7 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
     private AuximRuntimeSession NewChatSummary() =>
         new("", string.IsNullOrWhiteSpace(_pendingSessionTitle) ? "New conversation" : _pendingSessionTitle, default, default, false, []);
     private string _notice = "";
-    public bool UsesFixedLayout => InteractiveScreen.IsAlternateScreenActive;
+    public bool UsesFixedLayout => fixedLayout ?? InteractiveScreen.IsAlternateScreenActive;
 
     // Called only by the current foreground owner (editor or preview pump).
     public ScreenLayout? PrepareInputLayout(int requestedRows = 1)
@@ -149,7 +151,7 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
         {
             var first = next.IsDashboard ? Math.Min(prior.WelcomeRow, next.WelcomeRow) : Math.Min(prior.ComposerTop, next.ComposerTop);
             var last = next.IsDashboard ? Math.Max(prior.ShortcutsRow, next.ShortcutsRow) : next.Height;
-            for (var row = first; row <= last; row++) ScreenLayout.WriteRow(Console.Out, row, next.Columns, "");
+            for (var row = first; row <= last; row++) ScreenLayout.WriteRow(Output, row, next.Columns, "");
         }
         else
         {
@@ -160,23 +162,23 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
                 // The next workspace frame replaces every content row. Only
                 // clear the gap and old Composer margins during resize.
                 for (var row = next.ComposerTop - next.GapHeight; row <= next.Height; row++)
-                    ScreenLayout.WriteRow(Console.Out, row, next.Columns, "");
+                    ScreenLayout.WriteRow(Output, row, next.Columns, "");
             }
             else
-                for (var row = 1; row <= next.Height; row++) ScreenLayout.WriteRow(Console.Out, row, next.Columns, "");
+                for (var row = 1; row <= next.Height; row++) ScreenLayout.WriteRow(Output, row, next.Columns, "");
             if (next.HeaderHeight > 0)
-                ScreenLayout.WriteRow(Console.Out, 1, next.Columns, ConsoleTheme.AlignToComposer(ConsoleTheme.Header(next.IsDashboard ? "New Chat" : _running ? RunningPage : _title,
+                ScreenLayout.WriteRow(Output, 1, next.Columns, ConsoleTheme.AlignToComposer(ConsoleTheme.Header(next.IsDashboard ? "New Chat" : _running ? RunningPage : _title,
                     _running ? _cancelling ? "Cancelling" : "Running" : "Ready", next.ComposerWidth, decorated: true), next));
             if (next.HeaderHeight == 2)
-                ScreenLayout.WriteRow(Console.Out, 2, next.Columns, ConsoleTheme.AlignToComposer(ConsoleTheme.HeaderRule(next.ComposerWidth), next));
+                ScreenLayout.WriteRow(Output, 2, next.Columns, ConsoleTheme.AlignToComposer(ConsoleTheme.HeaderRule(next.ComposerWidth), next));
         }
         if (next.IsDashboard)
         {
             foreach (var (row, text) in RenderWelcomeRows(next, _runtime.GetStatus(), NewChatSummary()))
-                ScreenLayout.WriteRow(Console.Out, row, next.Columns, text);
+                ScreenLayout.WriteRow(Output, row, next.Columns, text);
         }
         else if (!_running) DrawFixedContent();
-        ConsoleTheme.WriteComposer(Console.Out, next, _running,
+        ConsoleTheme.WriteComposer(Output, next, _running,
             HistorySelectionHint(_running ? RunHint : _notice.Length > 0 ? _notice : ConsoleTheme.ComposerHint(next, CanGoBack)));
     }
 
@@ -204,7 +206,6 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
             else if (follow && _lastPageHeight != layout.ContentHeight)
                 _transcript.Reflow(_transcript.Lines, layout.ContentHeight, true);
             _lastPageHeight = layout.ContentHeight;
-            if (Page == InteractivePage.Resume) RevealResumeSelection(layout.ContentHeight);
             rows = _historyDocument is not null ? PaintHistoryRows(_transcript, layout, live: false)
                 : _transcript.GetVisibleLines(layout.ContentHeight).ToArray();
         }
@@ -214,7 +215,7 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
         }
         var visible = rows.Take(layout.ContentHeight).ToList();
         if (HasCommandResult && layout.ContentHeight > 0) OverlayCommandResult(visible, layout);
-        PaintContent(Console.Out, layout, visible);
+        PaintContent(Output, layout, visible);
     }
 
     // Only visible rows are cached. Idle/edge scrolls emit no terminal output.
@@ -291,12 +292,12 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
     internal void PaintApproval(IReadOnlyList<string> rows, ScreenLayout layout, bool feedback, bool layoutChanged)
     {
         EnsureFixedLayout(target: layout);
-        PaintContent(Console.Out, layout, rows);
+        PaintContent(Output, layout, rows);
         if (layoutChanged || feedback)
-            ConsoleTheme.WriteComposer(Console.Out, layout, true,
+            ConsoleTheme.WriteComposer(Output, layout, true,
                 feedback ? "Feedback for the model   Enter sends   Ctrl+C cancels" : "Approval owns input   Ctrl+C cancel");
-        Console.Out.Write($"\u001b[{layout.InputRow};{layout.InputStartColumn}H");
-        Console.Out.Flush();
+        Output.Write($"\u001b[{layout.InputRow};{layout.InputStartColumn}H");
+        Output.Flush();
     }
 
     internal ScreenLayout ApprovalLayout()
@@ -313,14 +314,14 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
         if (!_running)
         {
             DrawFixedContent();
-            ConsoleTheme.WriteComposer(Console.Out, _layout!.Value, false, ConsoleTheme.ComposerHint(_layout.Value, CanGoBack));
+            ConsoleTheme.WriteComposer(Output, _layout!.Value, false, ConsoleTheme.ComposerHint(_layout.Value, CanGoBack));
         }
         else
         {
             // The next preview frame replaces the panel's content rows.
             _paintedLayout = null;
             _paintedRunHint = null;
-            ConsoleTheme.WriteComposer(Console.Out, _layout!.Value, true, RunHint);
+            ConsoleTheme.WriteComposer(Output, _layout!.Value, true, RunHint);
         }
     }
 
@@ -379,7 +380,7 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
             var layout = _layout!.Value;
             WritePageHeader(layout, RunningPage, "Ready");
             DrawFixedContent();
-            ConsoleTheme.WriteComposer(Console.Out, layout, false,
+            ConsoleTheme.WriteComposer(Output, layout, false,
                 HistorySelectionHint(_notice.Length > 0 ? _notice : ConsoleTheme.ComposerHint(layout, CanGoBack)));
             SyncHistoryCopyControl();
             ApplyMousePolicy();
@@ -391,8 +392,8 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
 
     public StreamingPreview BeginStreamingPreview(string userInput)
     {
-        var mode = !Ansi.ControlSequencesEnabled ? PreviewOutputMode.Redirected
-            : UsesFixedLayout ? PreviewOutputMode.Alternate : PreviewOutputMode.Inline;
+        var mode = UsesFixedLayout ? PreviewOutputMode.Workspace
+            : Ansi.ControlSequencesEnabled ? PreviewOutputMode.Inline : PreviewOutputMode.Redirected;
         var saved = RenderTurnsToLines(UsesFixedLayout ? GetCurrentTurns() : []);
         _liveSavedLines = saved.Lines;
         ResetHistorySelection();
@@ -421,10 +422,10 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
             _suspended = false;
             ApplyMousePolicy();
             EnsureFixedLayout();
-            ConsoleTheme.WriteComposer(Console.Out, _layout!.Value, true, RunHint);
+            ConsoleTheme.WriteComposer(Output, _layout!.Value, true, RunHint);
         }
 
-        var renderer = new StreamingPreviewRenderer(Console.Out, Console.Error, mode, TerminalSize, transcript,
+        var renderer = new StreamingPreviewRenderer(Output, Console.Error, mode, TerminalSize, transcript,
             appendWorkspace: UsesFixedLayout ? _turnActivity.Append : null,
             refreshWorkspace: UsesFixedLayout ? PaintWorkspace : null);
         renderer.Refresh();
@@ -448,10 +449,10 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
         });
     }
 
-    private static void WritePageHeader(ScreenLayout layout, string page, string status)
+    private void WritePageHeader(ScreenLayout layout, string page, string status)
     {
         if (layout.HeaderHeight > 0)
-            ScreenLayout.WriteRow(Console.Out, 1, layout.Columns, ConsoleTheme.AlignToComposer(
+            ScreenLayout.WriteRow(Output, 1, layout.Columns, ConsoleTheme.AlignToComposer(
                 ConsoleTheme.Header(page, status, layout.ComposerWidth, decorated: true), layout));
     }
 
@@ -541,24 +542,24 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
                 transcript.Prepare(layout.ContentWidth, layout.ContentHeight, _followLive);
                 if (!HistoryTextSelection) TickHistorySelection(layout);
                 _liveHistoryOffset = transcript.Viewport.Offset;
-                changed |= PaintContent(Console.Out, layout, PaintHistoryRows(transcript.Viewport, layout, live: true));
+                changed |= PaintContent(Output, layout, PaintHistoryRows(transcript.Viewport, layout, live: true));
             }
             _liveHistoryRedraw = false;
         }
-        else changed |= PaintContent(Console.Out, layout, WorkspaceRows(layout));
+        else changed |= PaintContent(Output, layout, WorkspaceRows(layout));
 
         var hint = _cancelling ? "Cancelling · waiting for current operation" : HistorySelectionHint(RunHint);
         if (_cancelling) SyncHistoryCopyControl();
         if (_paintedRunHint != hint)
         {
             _paintedRunHint = hint;
-            ConsoleTheme.WriteComposerHint(Console.Out, layout, hint);
+            ConsoleTheme.WriteComposerHint(Output, layout, hint);
             changed = true;
         }
 
         if (!changed) return;
-        Console.Out.Write($"\u001b[{layout.InputRow};{layout.InputStartColumn}H");
-        Console.Out.Flush();
+        Output.Write($"\u001b[{layout.InputRow};{layout.InputStartColumn}H");
+        Output.Flush();
     }
 
     private IReadOnlyList<string> WorkspaceRows(ScreenLayout layout)
@@ -624,8 +625,9 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
     private static string Detail(string text, int width) =>
         Ansi.Muted("  " + ConsoleTheme.Summarize(CleanSummary(text), Math.Max(1, width - 2)));
 
-    private static (int Width, int Height) TerminalSize()
+    private (int Width, int Height) TerminalSize()
     {
+        if (size is not null) return size();
         try { return (LineEditor.TerminalWidth(), Math.Max(1, Console.WindowHeight)); }
         catch (IOException) { return (80, 24); }
     }
@@ -695,7 +697,7 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
         ConsoleTheme.Hint("Ctrl+A selects all input", "Shift+arrows extend selection", "Esc clears selection before navigation");
         ConsoleTheme.Hint("History: End follows live output; Esc returns to Main",
             "F2 or Ctrl+R toggles native selection; use your terminal's Copy command");
-        ConsoleTheme.Hint("/history opens history", "/show <n> opens one turn", "/jump <n> replays from a turn", "Esc returns to Main", "/session selects a saved session");
+        ConsoleTheme.Hint("/history opens history", "/show <n> opens one turn", "/jump <n> shows history from a turn", "Esc returns to Main", "/session selects a saved session");
         Console.WriteLine();
     }
 
@@ -1044,7 +1046,7 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
         var more = _resultViewport.TotalLines > height - 1;
         var controls = _resultExpanded ? "F3 shrink · Esc" : more ? "↑↓ · F3 expand · Esc" : "Esc";
         if (layout.ContentWidth < 48) controls = more || _resultExpanded ? "F3 · Esc" : "Esc";
-        var titleWidth = Math.Max(1, layout.ContentWidth - ConsoleTheme.CellWidth(controls) - 3);
+        var titleWidth = Math.Max(1, layout.ContentWidth - TerminalTextLayout.Measure(controls) - 3);
         rows.Add(Ansi.Accent(ConsoleTheme.Summarize(_commandHeading!, titleWidth)) + Ansi.Muted($"   {controls}"));
         rows.AddRange(_resultViewport.GetVisibleLines(height - 1));
     }
@@ -1431,7 +1433,7 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
     public void PrintShortcuts()
     {
         ConsoleTheme.Section("Shortcuts");
-        ConsoleTheme.Pair("Mouse wheel", "open and scroll conversation history while idle");
+        ConsoleTheme.Pair("Mouse wheel", "open and scroll conversation history while idle or working");
         ConsoleTheme.Pair("History / Preview", OperatingSystem.IsMacOS()
             ? "drag to select; press Ctrl+C or click Copy; Cmd+C if the terminal forwards it"
             : "drag to select; click Copy or press Ctrl+C with a selection");
@@ -1447,15 +1449,14 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
         ConsoleTheme.Pair("Shift+arrows", "extend input selection when supported by your terminal");
         ConsoleTheme.Pair("F2 / Ctrl+R (History/Preview)", "toggle native text selection; keyboard scrolling remains available");
         ConsoleTheme.Pair("Home/End", "jump to line boundary");
-        ConsoleTheme.Pair("Tab", "complete slash commands");
         ConsoleTheme.Pair("Ctrl+C", "cancel active turn; idle: clear selection, then draft; /exit to quit");
         ConsoleTheme.Pair("Ctrl+J", "newline when CR/LF are distinct; /paste is the fallback");
         ConsoleTheme.Pair("Shift+Enter", "newline only when the terminal sends an explicit modified Enter");
         ConsoleTheme.Pair("Ctrl+D", "exit from an empty prompt");
         ConsoleTheme.Pair("\\", "continue input on the next line");
         ConsoleTheme.Pair("//", "run the rest of the line in the real shell");
-        ConsoleTheme.Pair("/history", "list turn numbers in the current session");
-        ConsoleTheme.Pair("/jump n", "clear and replay conversation from turn n");
+        ConsoleTheme.Pair("/history", "open the current conversation history");
+        ConsoleTheme.Pair("/jump n", "show history from turn n");
         ConsoleTheme.Pair("Esc", "clear input selection first; otherwise return from History, Sessions or New Chat");
         ConsoleTheme.Pair("/new", "open New Chat; create a session on first send");
         ConsoleTheme.Pair("/session", "filter, preview and switch saved sessions");
@@ -1467,7 +1468,7 @@ internal sealed partial class InteractiveView(IAuximRuntime runtime, DateTimeOff
         {
             _notice = text;
             var layout = PrepareInputLayout(_inputRows)!.Value;
-            ConsoleTheme.WriteComposerHint(Console.Out, layout, text);
+            ConsoleTheme.WriteComposerHint(Output, layout, text);
             return;
         }
         ConsoleTheme.Hint(text);

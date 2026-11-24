@@ -4,7 +4,9 @@ namespace Auxim.Cli.Interactive;
 
 internal sealed class InteractiveScreen : IDisposable
 {
-    private readonly bool _enabled;
+    private static readonly object ScreenSync = new();
+    private static volatile bool _alternateScreen;
+    private static bool _closing;
     private bool _disposed;
 
     static InteractiveScreen()
@@ -16,31 +18,24 @@ internal sealed class InteractiveScreen : IDisposable
         RegisterPosixSignal(PosixSignal.SIGINT, 2);
     }
 
-    private InteractiveScreen(bool enabled)
-    {
-        _enabled = enabled;
-    }
-
     public static InteractiveScreen Enter()
     {
-        var enabled = ShouldUseAlternateScreen();
-        TerminalMouse.Reset();
-        if (!enabled)
+        var useAlternate = ShouldUseAlternateScreen();
+        if (useAlternate) TerminalInput.Restore(); // Pop before changing the screen stack.
+        lock (ScreenSync)
         {
-            IsAlternateScreenActive = false;
-            return new InteractiveScreen(enabled: false);
+            if (!_closing && useAlternate && WriteAndFlush("\u001b[?1049h\u001b[?25h"))
+            {
+                _alternateScreen = true;
+                WriteAndFlush("\u001b]0;Auxim\u0007");
+                Clear();
+            }
+            if (!_closing) TerminalMouse.Reset();
         }
-
-        TerminalInput.Restore(); // Pop on the old screen before changing its stack.
-        WriteAndFlush("\u001b[?1049h\u001b[?25h");
-        WriteAndFlush("\u001b]0;Auxim\u0007");
-
-        Clear();
-        IsAlternateScreenActive = true;
-        return new InteractiveScreen(enabled: true);
+        return new InteractiveScreen();
     }
 
-    public static bool IsAlternateScreenActive { get; private set; }
+    public static bool IsAlternateScreenActive => _alternateScreen;
 
     public static void SetHistoryScrollActive(bool active)
     {
@@ -73,46 +68,23 @@ internal sealed class InteractiveScreen : IDisposable
 
     public void Dispose()
     {
-        TerminalInput.Restore();
-        if (_disposed)
-        {
-            return;
-        }
-
-        if (_enabled)
-        {
-            TerminalMouse.DisableAlternateScroll();
-
-            WriteAndFlush("\u001b[?25h\u001b[?1049l");
-            IsAlternateScreenActive = false;
-        }
-
+        if (_disposed) return;
         _disposed = true;
-    }
-
-    internal static void EmergencyCleanup()
-    {
-        TerminalInput.Restore();
-        if (!IsAlternateScreenActive || !Ansi.ControlSequencesEnabled)
-        {
-            return;
-        }
-
-        TerminalMouse.DisableAlternateScroll();
-        WriteAndFlush("\u001b[?25h\u001b[?1049l");
-        IsAlternateScreenActive = false;
+        FullCleanup();
     }
 
     private static void FullCleanup()
     {
-        TerminalInput.Restore();
-        if (!Ansi.ControlSequencesEnabled)
+        TerminalInput.Restore(shuttingDown: true);
+        lock (ScreenSync)
         {
-            return;
+            if (_closing) return;
+            _closing = true;
+            TerminalMouse.Shutdown();
+            if (!_alternateScreen) return;
+            WriteAndFlush("\u001b[?25h\u001b[?1049l");
+            _alternateScreen = false;
         }
-
-        WriteAndFlush(TerminalMouse.DisableReports + "\u001b[?25h\u001b[?1049l");
-        IsAlternateScreenActive = false;
     }
 
     private static void RegisterPosixSignal(PosixSignal signal, int signum)
@@ -134,16 +106,18 @@ internal sealed class InteractiveScreen : IDisposable
         }
     }
 
-    private static void WriteAndFlush(string text)
+    private static bool WriteAndFlush(string text)
     {
         try
         {
             Console.Out.Write(text);
             Console.Out.Flush();
+            return true;
         }
         catch
         {
             // stdout may already be closed during shutdown.
+            return false;
         }
     }
 

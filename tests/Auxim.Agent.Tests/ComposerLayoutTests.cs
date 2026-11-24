@@ -100,7 +100,7 @@ public sealed class ComposerLayoutTests
         var draft = string.Concat(Enumerable.Repeat(text, 10));
         var layout = ScreenLayout.Create(width, 24);
         var row = InputRow.Create(ConsoleTheme.ComposerPrompt(layout.ComposerWidth), draft, draft.Length, layout.InputColumns);
-        Assert.True(ConsoleTheme.CellWidth(row.Text) <= layout.InputColumns);
+        Assert.True(TerminalTextLayout.Measure(row.Text) <= layout.InputColumns);
         Assert.StartsWith("  ", row.Text, StringComparison.Ordinal);
         Assert.InRange(row.CursorColumn, 4, layout.InputColumns - 1);
         using var writer = new StringWriter();
@@ -119,20 +119,6 @@ public sealed class ComposerLayoutTests
         Assert.Contains("\u001b[23;3H│  /help", writer.ToString());
         Assert.Single(Regex.Matches(writer.ToString(), "\\[23;3H"));
         AssertAllErasesInsideComposer(writer.ToString(), layout);
-    }
-
-    [Fact]
-    public void StreamingRefreshAndCleanupRestoreThePaddedInputPosition()
-    {
-        var layout = ScreenLayout.Create(80, 24);
-        using var writer = new StringWriter();
-        var transcript = new StreamingTranscript(() => [], "question", new TranscriptViewport());
-        var renderer = new StreamingPreviewRenderer(writer, writer, PreviewOutputMode.Alternate, () => (80, 24), transcript);
-        renderer.Append("first\nsecond");
-        Assert.EndsWith("\u001b[21;8H", writer.ToString(), StringComparison.Ordinal);
-        Assert.Equal(8, layout.InputStartColumn);
-        renderer.Finish(null);
-        Assert.EndsWith("\u001b[21;8H", writer.ToString(), StringComparison.Ordinal);
     }
 
     private static void AssertAllErasesInsideComposer(string frame, ScreenLayout layout)

@@ -24,7 +24,7 @@ public sealed class TerminalComponentTests
         using var output = new StringWriter();
         ConsoleTheme.WriteComposer(output, layout, false, ConsoleTheme.ComposerHint(layout, false));
         var rows = PaintedRows(output.ToString());
-        Assert.All(rows, row => Assert.Equal(layout.ComposerWidth, ConsoleTheme.CellWidth(row.Text)));
+        Assert.All(rows, row => Assert.Equal(layout.ComposerWidth, TerminalTextLayout.Measure(row.Text)));
         Assert.All(rows, row => Assert.Equal(layout.ComposerLeft, row.Column));
         Assert.StartsWith("╭", rows.First().Text, StringComparison.Ordinal);
         Assert.EndsWith("╯", rows.Single(r => r.Row == layout.ComposerTop + 4).Text, StringComparison.Ordinal);
@@ -54,7 +54,7 @@ public sealed class TerminalComponentTests
             var row = Assert.Single(PaintedRows(output.ToString()));
             Assert.StartsWith("│  › ", row.Text, StringComparison.Ordinal);
             Assert.EndsWith("  │", row.Text, StringComparison.Ordinal);
-            Assert.Equal(layout.ComposerWidth, ConsoleTheme.CellWidth(row.Text));
+            Assert.Equal(layout.ComposerWidth, TerminalTextLayout.Measure(row.Text));
             Assert.EndsWith($"\u001b[{layout.InputRow};{layout.ComposerInnerLeft + input.CursorColumn}H", output.ToString(), StringComparison.Ordinal);
         }
     }
@@ -85,8 +85,8 @@ public sealed class TerminalComponentTests
     public void DecoratedHeaderAndRuleAlwaysFit(int columns)
     {
         var header = TerminalTextLayout.Plain(ConsoleTheme.Header("Conversation", "Running", columns, true));
-        Assert.True(ConsoleTheme.CellWidth(header) <= columns);
-        Assert.Equal(columns, ConsoleTheme.CellWidth(ConsoleTheme.HeaderRule(columns)));
+        Assert.True(TerminalTextLayout.Measure(header) <= columns);
+        Assert.Equal(columns, TerminalTextLayout.Measure(ConsoleTheme.HeaderRule(columns)));
         if (columns >= 40)
         {
             Assert.StartsWith("◇ AUXIM /", header, StringComparison.Ordinal);
@@ -102,7 +102,7 @@ public sealed class TerminalComponentTests
         var footer = TerminalTextLayout.Plain(ConsoleTheme.DashboardStatus("local/placeholder", "Workspace review", 2, 119));
         Assert.Equal(2, footer.IndexOf("Model", StringComparison.Ordinal));
         Assert.True(footer.IndexOf("Workspace", StringComparison.Ordinal) > 60);
-        Assert.Equal(117, ConsoleTheme.CellWidth(footer));
+        Assert.Equal(117, TerminalTextLayout.Measure(footer));
         Assert.EndsWith("2 messages", footer, StringComparison.Ordinal);
     }
 

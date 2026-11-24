@@ -37,7 +37,7 @@ public sealed class VisualThemeTests
     public void HeaderFitsAndOnlyWideWindowsIncludeState(int columns)
     {
         var header = ConsoleTheme.Header("Conversation 历史 👨‍👩‍👧‍👦", "Working", columns);
-        Assert.True(ConsoleTheme.CellWidth(header) <= columns);
+        Assert.True(TerminalTextLayout.Measure(header) <= columns);
         if (columns >= 40) Assert.EndsWith("Working", TerminalTextLayout.Plain(header), StringComparison.Ordinal);
         else Assert.DoesNotContain("Working", TerminalTextLayout.Plain(header));
     }
@@ -56,8 +56,8 @@ public sealed class VisualThemeTests
         var layout = ScreenLayout.Create(columns + 1, 12);
         var row = InputRow.Create(prompt, draft, draft.Length, layout.InputColumns);
         var styled = ConsoleTheme.ComposerLine(row.Text, columns);
-        Assert.True(ConsoleTheme.CellWidth(styled) <= columns);
-        if (columns >= 12) Assert.Equal(columns, ConsoleTheme.CellWidth(styled));
+        Assert.True(TerminalTextLayout.Measure(styled) <= columns);
+        if (columns >= 12) Assert.Equal(columns, TerminalTextLayout.Measure(styled));
         Assert.InRange(row.CursorColumn, 0, Math.Max(0, columns - 1));
         Assert.DoesNotContain("auxim >", TerminalTextLayout.Plain(styled));
         // A wider window reveals the complete original draft, including Unicode.
@@ -75,5 +75,34 @@ public sealed class VisualThemeTests
     {
         foreach (var row in new[] { "You", "Assistant  streaming", "Tool  file.write  running  /  1 resources", "Tool  echo  succeeded  /  4 chars", "Tool  echo  failed", "  **unfinished markdown", "  中文 🙂" })
             Assert.Equal(row, TerminalTextLayout.Plain(ConsoleTheme.StreamingRow(row)));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(8)]
+    [InlineData(16)]
+    [InlineData(32)]
+    [InlineData(90)]
+    public void PanelAndCommandGridBudgetUsesTerminalCells(int width)
+    {
+        const string body = "中文🙂 e\u0301 👨‍👩‍👧‍👦 🇺🇸\tlabel text " +
+            "Long unbroken value: abcdefghijklmnopqrstuvwxyz";
+        var panel = ConsoleTheme.PanelRows([("模型", body), ("session", body)], width);
+        var help = ConsoleTheme.CommandRows([new("/history", body), new("/help", body)], width);
+        foreach (var row in panel.Concat(help))
+        {
+            Assert.InRange(TerminalTextLayout.Measure(row), 0, width);
+            Assert.DoesNotContain("�", string.Concat(row.EnumerateRunes()));
+        }
+    }
+
+    [Theory]
+    [InlineData("中文", 1, ".")]
+    [InlineData("🙂🙂", 3, "🙂…")]
+    [InlineData("e\u0301文", 2, "e\u0301.")]
+    public void SummariesNeverSplitGraphemes(string text, int width, string expected)
+    {
+        if (width == 3 && !TerminalGlyphs.UnicodeEnabled) expected = "...";
+        Assert.Equal(expected, ConsoleTheme.Summarize(text, width));
     }
 }

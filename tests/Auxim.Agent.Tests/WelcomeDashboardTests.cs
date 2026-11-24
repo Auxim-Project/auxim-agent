@@ -27,7 +27,7 @@ public sealed class WelcomeDashboardTests
         foreach (var item in rows.Where(r => r.Row != metadata))
         {
             var text = Plain(item.Text);
-            Assert.Equal((layout.Columns - ConsoleTheme.CellWidth(text.TrimStart())) / 2, text.Length - text.TrimStart().Length);
+            Assert.Equal((layout.Columns - TerminalTextLayout.Measure(text.TrimStart())) / 2, text.Length - text.TrimStart().Length);
         }
         Assert.Contains("local/placeholder", Plain(rows.Single(r => r.Row == metadata).Text));
         Assert.DoesNotContain(rows, r => r.Row >= composer && r.Row < composer + layout.ComposerHeight);
@@ -50,7 +50,7 @@ public sealed class WelcomeDashboardTests
         {
             Assert.InRange(row.Row, layout.ContentTop, height);
             Assert.True(row.Row < layout.ComposerTop);
-            Assert.True(ConsoleTheme.CellWidth(row.Text) <= layout.Columns);
+            Assert.True(TerminalTextLayout.Measure(row.Text) <= layout.Columns);
         });
         Assert.Equal(height - layout.ComposerHeight + 1, layout.ComposerTop);
     }

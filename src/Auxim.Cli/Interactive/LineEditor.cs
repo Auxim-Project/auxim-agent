@@ -10,7 +10,6 @@ internal sealed class LineEditor
     private readonly Action<int, Action>? _scrollHandler;
     private readonly Action<int, Action>? _wheelHandler;
     private int _lastRenderWidth;
-    private int _lastRenderLines = 1;
     private int _lastCursorLine;
     private readonly Func<int, ScreenLayout?>? _inputLayout;
     private ScreenLayout? _lastLayout;
@@ -107,8 +106,7 @@ internal sealed class LineEditor
         LoadDraft(_isNewChat?.Invoke() == true);
         _lastLayout = _inputLayout?.Invoke(_draft.RequestedRows);
         if (_lastLayout is null) Console.Write(prompt);
-        _lastRenderWidth = DisplayWidth(visiblePrompt);
-        _lastRenderLines = 1;
+        _lastRenderWidth = TerminalTextLayout.Measure(visiblePrompt);
         _lastCursorLine = 0;
         var buffer = _draft.Buffer;
         ref var cursor = ref _draft.Cursor;
@@ -596,7 +594,7 @@ internal sealed class LineEditor
         {
             var item = i == _selectedSuggestion ? $"[{_suggestions[i]}]" : _suggestions[i];
             if (i == _selectedSuggestion) item = ConsoleTheme.Summarize(item, available);
-            var width = ConsoleTheme.CellWidth(item);
+            var width = TerminalTextLayout.Measure(item);
             if (width == 0 || output.Length + width > available) break;
             var start = layout.ComposerInnerLeft + indent + output.Length;
             _suggestionHits.Add((start, start + width, i));
@@ -666,89 +664,20 @@ internal sealed class LineEditor
         _lastTerminalWidth = terminalWidth;
         _lastTerminalHeight = TerminalHeight();
         TrackInputWidth(terminalWidth);
-        if (_acceptPaste || _draft.ContainsPaste || text.Any(char.IsControl))
-        {
-            RenderInlinePaste(text, cursor, visiblePrompt, terminalWidth, prompt);
-            return;
-        }
-        var fullWidth = DisplayWidth(visiblePrompt) + DisplayWidth(text);
-
-        if (Ansi.ControlSequencesEnabled)
-        {
-            var lines = WrapInput(prompt, visiblePrompt, text, terminalWidth);
-            var cursorPosition = CursorPosition(visiblePrompt, text[..cursor], terminalWidth);
-
-            // Move cursor to start of previous render area
-            // _lastCursorLine is the 0-based line within the previous block where the cursor sits
-            if (_lastCursorLine > 0)
-            {
-                Console.Write($"\u001b[{_lastCursorLine}A");
-            }
-
-            Console.Write("\r");
-            // Clear from cursor to end of screen — clears all wrapped lines
-            Console.Write("\u001b[0J");
-
-            WriteWrappedLines(lines);
-
-            var linesFromEnd = lines.Count - 1 - cursorPosition.Line;
-            if (linesFromEnd > 0)
-            {
-                Console.Write($"\u001b[{linesFromEnd}A");
-            }
-
-            Console.Write("\r");
-            if (cursorPosition.Column > 0)
-            {
-                Console.Write($"\u001b[{cursorPosition.Column}C");
-            }
-
-            _lastRenderWidth = fullWidth;
-            _lastRenderLines = lines.Count;
-            _lastCursorLine = cursorPosition.Line;
-            return;
-        }
-
-        // Non-ANSI fallback — best-effort single-line redraw
-        Console.Write('\r');
-        Console.Write(prompt);
-        Console.Write(text);
-        if (_lastRenderWidth > fullWidth)
-        {
-            Console.Write(new string(' ', _lastRenderWidth - fullWidth));
-        }
-
-        Console.Write('\r');
-        Console.Write(prompt);
-        if (cursor > 0)
-        {
-            Console.Write(text[..cursor]);
-        }
-
-        _lastRenderWidth = fullWidth;
+        RenderInline(text, cursor, visiblePrompt, terminalWidth, prompt);
     }
 
-    private void RenderInlinePaste(string text, int cursor, string prompt, int width, string styledPrompt)
+    private void RenderInline(string text, int cursor, string prompt, int width, string styledPrompt)
     {
         var projection = TerminalTextLayout.LayoutInput(text, cursor, width, prompt, _draft.ForwardAffinity);
         if (!Ansi.ControlSequencesEnabled)
         {
             var row = projection.Rows[projection.CursorRow].Text;
             Console.Write('\r'); Console.Write(row);
-            Console.Write(new string(' ', Math.Max(0, _lastRenderWidth - ConsoleTheme.CellWidth(row))));
+            Console.Write(new string(' ', Math.Max(0, _lastRenderWidth - TerminalTextLayout.Measure(row))));
             Console.Write('\r');
-            var beforeCursor = new StringBuilder();
-            var cells = 0;
-            var elements = StringInfo.GetTextElementEnumerator(row);
-            while (elements.MoveNext())
-            {
-                var element = elements.GetTextElement();
-                var next = cells + TerminalTextLayout.CellWidth(element);
-                if (next > projection.CursorColumn) break;
-                beforeCursor.Append(element); cells = next;
-            }
-            Console.Write(beforeCursor.ToString());
-            _lastRenderWidth = ConsoleTheme.CellWidth(row);
+            Console.Write(TerminalTextLayout.TakeCells(row, projection.CursorColumn));
+            _lastRenderWidth = TerminalTextLayout.Measure(row);
             return;
         }
         if (_lastCursorLine > 0) Console.Write($"\u001b[{_lastCursorLine}A");
@@ -766,107 +695,12 @@ internal sealed class LineEditor
         Console.Write('\r');
         if (projection.CursorColumn > 0) Console.Write($"\u001b[{projection.CursorColumn}C");
         _lastCursorLine = cursorRow;
-        _lastRenderLines = visible.Length;
     }
 
     private static int TerminalHeight()
     {
         try { return Console.WindowHeight > 0 ? Console.WindowHeight : 24; }
         catch (IOException) { return 24; }
-    }
-
-    private static IReadOnlyList<string> WrapInput(
-        string prompt,
-        string visiblePrompt,
-        string text,
-        int terminalWidth)
-    {
-        var lines = new List<string>();
-        var current = new StringBuilder();
-        var currentWidth = 0;
-        AppendPrompt(lines, current, ref currentWidth, prompt, visiblePrompt, terminalWidth);
-        AppendText(lines, current, ref currentWidth, text, terminalWidth);
-        lines.Add(current.ToString());
-        return lines;
-    }
-
-    private static void AppendPrompt(
-        List<string> lines,
-        StringBuilder current,
-        ref int currentWidth,
-        string prompt,
-        string visiblePrompt,
-        int terminalWidth)
-    {
-        var promptWidth = DisplayWidth(visiblePrompt);
-        if (currentWidth > 0 && currentWidth + promptWidth > terminalWidth)
-        {
-            lines.Add(current.ToString());
-            current.Clear();
-            currentWidth = 0;
-        }
-
-        current.Append(prompt);
-        currentWidth += promptWidth;
-        if (currentWidth >= terminalWidth)
-        {
-            lines.Add(current.ToString());
-            current.Clear();
-            currentWidth = 0;
-        }
-    }
-
-    private static void AppendText(
-        List<string> lines,
-        StringBuilder current,
-        ref int currentWidth,
-        string text,
-        int terminalWidth)
-    {
-        foreach (var rune in text.EnumerateRunes())
-        {
-            var runeText = rune.ToString();
-            var width = RuneWidth(rune);
-            if (currentWidth > 0 && currentWidth + width > terminalWidth)
-            {
-                lines.Add(current.ToString());
-                current.Clear();
-                currentWidth = 0;
-            }
-
-            current.Append(runeText);
-            currentWidth += width;
-            if (currentWidth >= terminalWidth)
-            {
-                lines.Add(current.ToString());
-                current.Clear();
-                currentWidth = 0;
-            }
-        }
-    }
-
-    private static (int Line, int Column) CursorPosition(string visiblePrompt, string textBeforeCursor, int terminalWidth)
-    {
-        var line = 0;
-        var column = 0;
-        foreach (var rune in (visiblePrompt + textBeforeCursor).EnumerateRunes())
-        {
-            var width = RuneWidth(rune);
-            if (column > 0 && column + width > terminalWidth)
-            {
-                line++;
-                column = 0;
-            }
-
-            column += width;
-            if (column >= terminalWidth)
-            {
-                line++;
-                column = 0;
-            }
-        }
-
-        return (line, column);
     }
 
     private static void WriteWrappedLines(IReadOnlyList<string> lines)
@@ -890,7 +724,6 @@ internal sealed class LineEditor
     private void ResetRenderState()
     {
         _lastRenderWidth = 0;
-        _lastRenderLines = 1;
         _lastCursorLine = 0;
     }
 
@@ -904,17 +737,6 @@ internal sealed class LineEditor
         {
             return 80;
         }
-    }
-
-    internal static int DisplayWidth(string text)
-    {
-        var width = 0;
-        foreach (var rune in text.EnumerateRunes())
-        {
-            width += RuneWidth(rune);
-        }
-
-        return width;
     }
 
     private static int PreviousTextElementIndex(string text, int cursor)
@@ -958,66 +780,4 @@ internal sealed class LineEditor
         return text.Length;
     }
 
-    private static int RuneWidth(Rune rune)
-    {
-        var category = Rune.GetUnicodeCategory(rune);
-        if (category is UnicodeCategory.NonSpacingMark
-            or UnicodeCategory.EnclosingMark
-            or UnicodeCategory.Format
-            or UnicodeCategory.Control)
-        {
-            return 0;
-        }
-
-        return IsWide(rune.Value) ? 2 : 1;
-    }
-
-    private static bool IsWide(int value)
-    {
-        return value is >= 0x1100 and <= 0x115f
-            or >= 0x231a and <= 0x231b
-            or >= 0x2329 and <= 0x232a
-            or >= 0x23e9 and <= 0x23ec
-            or >= 0x23f0 and <= 0x23f0
-            or >= 0x23f3 and <= 0x23f3
-            or >= 0x25fd and <= 0x25fe
-            or >= 0x2614 and <= 0x2615
-            or >= 0x2648 and <= 0x2653
-            or >= 0x267f and <= 0x267f
-            or >= 0x2693 and <= 0x2693
-            or >= 0x26a1 and <= 0x26a1
-            or >= 0x26aa and <= 0x26ab
-            or >= 0x26bd and <= 0x26be
-            or >= 0x26c4 and <= 0x26c5
-            or >= 0x26ce and <= 0x26ce
-            or >= 0x26d4 and <= 0x26d4
-            or >= 0x26ea and <= 0x26ea
-            or >= 0x26f2 and <= 0x26f3
-            or >= 0x26f5 and <= 0x26f5
-            or >= 0x26fa and <= 0x26fa
-            or >= 0x26fd and <= 0x26fd
-            or >= 0x2705 and <= 0x2705
-            or >= 0x270a and <= 0x270b
-            or >= 0x2728 and <= 0x2728
-            or >= 0x274c and <= 0x274c
-            or >= 0x274e and <= 0x274e
-            or >= 0x2753 and <= 0x2755
-            or >= 0x2757 and <= 0x2757
-            or >= 0x2795 and <= 0x2797
-            or >= 0x27b0 and <= 0x27b0
-            or >= 0x27bf and <= 0x27bf
-            or >= 0x2b1b and <= 0x2b1c
-            or >= 0x2b50 and <= 0x2b50
-            or >= 0x2b55 and <= 0x2b55
-            or >= 0x2e80 and <= 0xa4cf
-            or >= 0xac00 and <= 0xd7a3
-            or >= 0xf900 and <= 0xfaff
-            or >= 0xfe10 and <= 0xfe19
-            or >= 0xfe30 and <= 0xfe6f
-            or >= 0xff00 and <= 0xff60
-            or >= 0xffe0 and <= 0xffe6
-            or >= 0x1f300 and <= 0x1f64f
-            or >= 0x1f900 and <= 0x1f9ff
-            or >= 0x20000 and <= 0x3fffd;
-    }
 }

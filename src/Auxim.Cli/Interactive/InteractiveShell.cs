@@ -67,7 +67,7 @@ internal static class InteractiveShell
                 if (submission.Kind == InputSubmissionKind.CliCommand)
                 {
                     history.Add(submission);
-                    var parts = SplitCommand(input[1..]);
+                    var parts = InteractiveCommandParser.Tokenize(input[1..]);
                     var presentation = InteractiveCommandResult.Classify(parts);
                     var exitCode = 0;
                     try
@@ -75,7 +75,7 @@ internal static class InteractiveShell
                         if (presentation == CommandPresentation.Result)
                         {
                             // These branches complete synchronously: no input, tools or approval.
-                            var result = InteractiveCommandResult.Capture(() => RunSlashCommandAsync(input).GetAwaiter().GetResult());
+                            var result = InteractiveCommandResult.Capture(() => RunSlashCommandAsync(parts).GetAwaiter().GetResult());
                             ApplySessionTransition(parts, result.ExitCode);
                             _view.ShowCommandResult(parts.FirstOrDefault() ?? "command", result);
                             exitCode = result.ExitCode;
@@ -84,8 +84,8 @@ internal static class InteractiveShell
                             && parts[1] == "run")
                             exitCode = await RunDirectToolAsync(parts.Skip(1).ToArray(), interrupts);
                         else if (presentation == CommandPresentation.Foreground)
-                            exitCode = await RunForegroundAsync(() => RunSlashCommandAsync(input));
-                        else exitCode = await RunSlashCommandAsync(input);
+                            exitCode = await RunForegroundAsync(() => RunSlashCommandAsync(parts));
+                        else exitCode = await RunSlashCommandAsync(parts);
                     }
                     catch (ConfigurationPromptCancelledException)
                     {
@@ -251,9 +251,8 @@ internal static class InteractiveShell
         finally { _view.RestoreLayout(); }
     }
 
-    private static async Task<int> RunSlashCommandAsync(string input)
+    private static async Task<int> RunSlashCommandAsync(IReadOnlyList<string> parts)
     {
-        var parts = SplitCommand(input[1..]);
         if (parts.Count == 0)
         {
             return 0;
@@ -315,8 +314,8 @@ internal static class InteractiveShell
                 _view.PrintShortcuts();
                 return 0;
             case "paste":
-                Console.WriteLine("/paste is only available from the main prompt.");
-                return 0;
+                Console.Error.WriteLine("Usage: /paste (finish the block with . on its own line).");
+                return 1;
             case "model":
                 return CommandHandlers.HandleModel(args, _runtime);
             case "auth":
@@ -469,24 +468,16 @@ internal static class InteractiveShell
         }
 
         var submission = editor.Submission ?? throw new InvalidOperationException("Missing input submission type.");
-        if (editor.SubmittedPaste || (submission.Kind != InputSubmissionKind.CliCommand || input.Trim() != "/paste") && !input.EndsWith('\\')) return submission;
+        var paste = submission.Kind == InputSubmissionKind.CliCommand
+            && input.Trim().Equals("/paste", StringComparison.OrdinalIgnoreCase);
+        if (editor.SubmittedPaste || !paste && !input.EndsWith('\\')) return submission;
         _view.SuspendLayout();
-        try { return new(ReadContinuedInput(editor, input), InputSubmissionKind.AgentMessage); }
+        try { return new(paste ? ReadPasteBlock(editor) : ReadContinuedInput(editor, input), InputSubmissionKind.AgentMessage); }
         finally { _view.RestoreLayout(); }
     }
 
     private static string ReadContinuedInput(LineEditor editor, string input)
     {
-        if (input.Trim() == "/paste")
-        {
-            return ReadPasteBlock(editor);
-        }
-
-        if (!input.EndsWith('\\'))
-        {
-            return input;
-        }
-
         var lines = new List<string> { input[..^1] };
         while (true)
         {
@@ -569,10 +560,5 @@ internal static class InteractiveShell
             InteractiveInterrupt.Current!.EndTurn();
             TerminalMouse.Reset();
         }
-    }
-
-    private static IReadOnlyList<string> SplitCommand(string input)
-    {
-        return InteractiveCommandParser.Tokenize(input);
     }
 }

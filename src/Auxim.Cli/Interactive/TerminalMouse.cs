@@ -5,6 +5,7 @@ internal enum TerminalMouseMode { Off, Normal, Drag, NativeSelection }
 internal static class TerminalMouse
 {
     private static readonly object Sync = new();
+    private static bool _shuttingDown;
     internal const string DisableReports = "\u001b[?9l\u001b[?1000l\u001b[?1002l\u001b[?1003l"
         + "\u001b[?1005l\u001b[?1006l\u001b[?1007l\u001b[?1015l\u001b[?1016l";
     public static TerminalMouseMode Mode { get; private set; }
@@ -14,6 +15,7 @@ internal static class TerminalMouse
     {
         lock (Sync)
         {
+            if (_shuttingDown) return;
             if (Ansi.ControlSequencesEnabled)
                 WriteAndFlush(DisableReports);
             Mode = TerminalMouseMode.Off;
@@ -27,7 +29,7 @@ internal static class TerminalMouse
             mode = TerminalMouseMode.Off;
         lock (Sync)
         {
-            if (Mode == mode) return;
+            if (_shuttingDown || Mode == mode) return;
             if (Ansi.ControlSequencesEnabled)
             {
                 // Release reports before native selection. Never enable mode
@@ -42,6 +44,16 @@ internal static class TerminalMouse
             TerminalInput.SetNativeMouseInput(mode);
             Mode = mode;
             Revision++;
+        }
+    }
+
+    public static void Shutdown()
+    {
+        lock (Sync)
+        {
+            if (_shuttingDown) return;
+            SetMode(TerminalMouseMode.Off);
+            _shuttingDown = true;
         }
     }
 

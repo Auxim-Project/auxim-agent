@@ -22,7 +22,7 @@ public sealed class MultilineInputTests
         Assert.Equal(rows, string.Join('|', projection.Rows.Select(r => r.Text)));
         Assert.Equal(row, projection.CursorRow);
         Assert.Equal(column, projection.CursorColumn);
-        Assert.All(projection.Rows, r => Assert.True(ConsoleTheme.CellWidth(r.Text) < columns));
+        Assert.All(projection.Rows, r => Assert.True(TerminalTextLayout.Measure(r.Text) < columns));
     }
 
     [Theory]
@@ -50,7 +50,7 @@ public sealed class MultilineInputTests
         var text = "中文🙂very long draft";
         var projection = TerminalTextLayout.LayoutInput(text, text.Length, columns, "  › ");
         Assert.InRange(projection.CursorColumn, 0, Math.Max(0, columns - 1));
-        Assert.All(projection.Rows, r => Assert.True(ConsoleTheme.CellWidth(r.Text) <= columns));
+        Assert.All(projection.Rows, r => Assert.True(TerminalTextLayout.Measure(r.Text) <= columns));
         Assert.Equal(text, text[projection.Rows[0].StartUtf16..projection.Rows[^1].EndUtf16]);
     }
 
@@ -168,25 +168,5 @@ public sealed class MultilineInputTests
         LineEditor.ReplaceCompletion(buffer, ref cursor, 3, "/help");
         Assert.Equal("/help" + tail, buffer.ToString());
         Assert.Equal(5, cursor);
-    }
-
-    [Fact]
-    public void StreamRendererNoticesContentGeometryChangesWithoutAResizeOrDelta()
-    {
-        var layout = ScreenLayout.Create(80, 24);
-        using var output = new StringWriter();
-        var viewport = new TranscriptViewport();
-        var transcript = new StreamingTranscript(() => [], "question", viewport);
-        var renderer = new StreamingPreviewRenderer(output, output, PreviewOutputMode.Alternate, () => (80, 24), transcript, () => layout);
-        renderer.Append(string.Join('\n', Enumerable.Range(1, 40).Select(i => $"line {i}")));
-        layout = ScreenLayout.Create(80, 24, inputRows: 4);
-        output.GetStringBuilder().Clear(); renderer.Refresh();
-        Assert.Equal(viewport.TotalLines - layout.ContentHeight, viewport.Offset);
-        Assert.EndsWith($"\u001b[{layout.InputRow};{layout.InputStartColumn}H", output.ToString(), StringComparison.Ordinal);
-        output.GetStringBuilder().Clear(); renderer.Refresh(); Assert.Empty(output.ToString());
-        renderer.Finish(null);
-        foreach (System.Text.RegularExpressions.Match erase in System.Text.RegularExpressions.Regex.Matches(output.ToString(), "\u001b\\[(\\d+);1H\u001b\\[2K"))
-            Assert.InRange(int.Parse(erase.Groups[1].Value), layout.ContentTop, layout.ContentTop + layout.ContentHeight - 1);
-        Assert.EndsWith($"\u001b[{layout.InputRow};{layout.InputStartColumn}H", output.ToString(), StringComparison.Ordinal);
     }
 }

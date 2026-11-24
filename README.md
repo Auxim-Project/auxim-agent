@@ -69,6 +69,14 @@ dotnet run --project src/Auxim.Cli -c Release --no-build
 Use `/help` for interactive commands and `/exit` to quit. With no configuration,
 the default `local` provider only echoes input; it does not run a language model.
 
+Use `/session` to browse saved sessions and `/history` to read the current
+conversation. `/jump <n>` opens History from turn `n`. Use `/paste` for
+multiline input and finish the block with a single `.` on its own line.
+Alternate-screen terminals with mouse reporting support selection and
+scrolling in History and Session Preview. Use **Copy** or Ctrl+C with a
+selection. F2 switches to the terminal's native selection when available.
+Set `AUXIM_NO_ALT_SCREEN=1` to use inline mode.
+
 ## CLI Commands
 
 Pass these arguments after `--` in the `dotnet run` command shown above:
@@ -89,7 +97,9 @@ Pass these arguments after `--` in the `dotnet run` command shown above:
 
 Configuration and credentials are stored under `~/.auxim` by default, in
 `config.json` and `.env`. Set `AUXIM_HOME` to use a different directory. Resource
-approval prompts require an interactive terminal.
+approval prompts require a supported POSIX terminal input backend. Auxim
+denies approval requests when that backend is unavailable, including on
+Windows. Terminal keyboard, mouse and clipboard behavior depends on the host.
 
 ### Connect a model service
 
@@ -131,6 +141,22 @@ dotnet test Auxim.Agent.sln -c Release --no-build --no-restore
 
 The current tests use injected clients and HTTP handlers and do not require a
 live model service or API key.
+
+Run the CLI's pseudo-terminal regressions on macOS or Linux with Python 3
+after the Release build. The model-backed cases start local HTTP fixtures
+and require loopback access.
+
+```bash
+for test in configuration_cancel direct_tool_cancel history_selection input_history \
+            kitty_diagnostic kitty_keys kitty_protocol terminal_modes workspace_controls; do
+  PYTHONDONTWRITEBYTECODE=1 python3 "tests/pty/$test.py" || exit $?
+done
+```
+
+The PTY tests inject key and mouse sequences and can use a substitute
+clipboard backend. Physical shortcuts, desktop clipboard integration and
+Windows terminal behavior need separate host testing. No live model or API
+key is required.
 
 ## Project Status
 

@@ -15,8 +15,6 @@ internal static class Ansi
 
     public static string Bold(string text) => Wrap("1", text);
 
-    public static string Dim(string text) => Wrap("2", text);
-
     public static string Accent(string text) => Color(text, 156, 151, 219, 140, 95);
     public static string Text(string text) => Color(text, 240, 240, 243, 255, 37);
     public static bool SupportsSurfaces => Enabled && ColorDepth != TerminalColorDepth.Basic;
@@ -57,20 +55,6 @@ internal static class Ansi
     public static string Muted(string text) => Color(text, 154, 159, 171, 247, 90);
 
     public static string Reverse(string text) => Wrap("7", text);
-
-    public static string AccentBackground(string text) => Composer(Accent(text));
-
-    public static string WarningBackground(string text) => Composer(Warning(text));
-
-    public static string ErrorBackground(string text) => Composer(Error(text));
-
-    public static string Cyan(string text) => Accent(text);
-
-    public static string Blue(string text) => Accent(text);
-
-    public static string Magenta(string text) => Accent(text);
-
-    public static string SoftBackground(string text) => Composer(Text(text));
 
     private static string Wrap(string code, string text)
     {

@@ -43,7 +43,7 @@ internal readonly record struct ScreenLayout(int Width, int Height, bool IsDashb
     public int HintRow => HintHeight == 0 ? 0 : InputRow + InputRows - 1 + (HasComposerBorder ? 2 : 1);
     public int InputRightPadding => ComposerWidth >= 12 ? 2 : 0;
     public int InputColumns => Math.Max(0, ComposerInnerWidth - InputRightPadding);
-    public int InputStartColumn => Math.Min(ConsoleTheme.CellWidth(ConsoleTheme.ComposerPrompt(ComposerWidth)),
+    public int InputStartColumn => Math.Min(TerminalTextLayout.Measure(ConsoleTheme.ComposerPrompt(ComposerWidth)),
         Math.Max(0, InputColumns - 1)) + ComposerInnerLeft;
     public int ContentHeight => Math.Max(0, ComposerTop - GapHeight - ContentTop);
     public int ContentWidth => Math.Max(1, ConsoleTheme.ReadableWidth(Columns));
@@ -76,8 +76,9 @@ internal readonly record struct InputRow(string Text, int CursorColumn)
     {
         if (columns <= 0) return new("", 0);
         var prefix = TerminalTextLayout.Plain(prompt);
-        if (Cells(prefix) + 2 > columns) prefix = columns >= 3 ? "> " : "";
-        var available = columns - Cells(prefix);
+        if (TerminalTextLayout.Measure(prefix) + 2 > columns) prefix = columns >= 3 ? "> " : "";
+        var prefixWidth = TerminalTextLayout.Measure(prefix);
+        var available = columns - prefixWidth;
         var indexes = StringInfo.ParseCombiningCharacters(text);
         var elements = indexes.Select((start, i) => text[start..(i + 1 < indexes.Length ? indexes[i + 1] : text.Length)])
             .Select(e => e.Any(char.IsControl) ? " " : e).ToArray();
@@ -95,11 +96,8 @@ internal readonly record struct InputRow(string Text, int CursorColumn)
             if (cells + width > available) break;
             row.Append(elements[i]); cells += width;
         }
-        return new(row.ToString(), Math.Min(columns - 1, Cells(prefix) + used));
+        return new(row.ToString(), Math.Min(columns - 1, prefixWidth + used));
     }
-
-    private static int Cells(string text) => StringInfo.ParseCombiningCharacters(text)
-        .Select(start => StringInfo.GetNextTextElement(text, start)).Sum(TerminalTextLayout.CellWidth);
 
     public void Write(TextWriter output, ScreenLayout layout, bool placeholder = false)
     {
