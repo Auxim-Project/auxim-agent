@@ -72,6 +72,114 @@ public sealed class AuximAgentToolExecutionTests
                 StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task TurnCancellationStopsRemainingToolsAndModelRequests(bool toolThrows)
+    {
+        using var turn = new CancellationTokenSource();
+        var client = new CountingToolClient();
+        var tools = new ScriptedTools(token =>
+        {
+            turn.Cancel();
+            if (toolThrows) token.ThrowIfCancellationRequested();
+            return Task.FromResult("completed despite cancellation");
+        });
+        var agent = new AuximAgent(client, new ToolRegistry(), tools);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            agent.RunConversationAsync("run two tools", cancellationToken: turn.Token));
+        Assert.Equal(1, tools.Count);
+        Assert.Single(client.Requests);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ToolTimeoutAndFailureAreReportedWithoutCancellingTheTurn(bool toolTimesOut)
+    {
+        using var toolTimeout = new CancellationTokenSource();
+        toolTimeout.Cancel();
+        var client = new CountingToolClient();
+        var tools = new ScriptedTools(_ => toolTimesOut
+            ? Task.FromCanceled<string>(toolTimeout.Token)
+            : Task.FromException<string>(new InvalidOperationException("ordinary tool failure")));
+        var agent = new AuximAgent(client, new ToolRegistry(), tools);
+
+        var result = await agent.RunConversationAsync("run two tools");
+        Assert.Equal("finished", result.FinalResponse);
+        Assert.Equal(2, tools.Count);
+        Assert.Equal(2, client.Requests.Count);
+        var replies = client.Requests[1].Where(message => message.Role == "tool").ToArray();
+        Assert.Equal(2, replies.Length);
+        foreach (var reply in replies)
+        {
+            using var json = JsonDocument.Parse(reply.Content);
+            Assert.True(json.RootElement.GetProperty("error").GetBoolean());
+            Assert.False(json.RootElement.TryGetProperty("denied", out _));
+        }
+    }
+
+    [Fact]
+    public async Task AModelThatReturnsSuccessAfterCancellationCannotCompleteTheTurn()
+    {
+        using var turn = new CancellationTokenSource();
+        var client = new CountingToolClient(() => turn.Cancel());
+        var tools = new ScriptedTools(_ => Task.FromResult("tool output"));
+        var agent = new AuximAgent(client, new ToolRegistry(), tools);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            agent.RunConversationAsync("run two tools", cancellationToken: turn.Token));
+        Assert.Equal(2, tools.Count);
+        Assert.Equal(2, client.Requests.Count);
+    }
+
+    [Fact]
+    public async Task AlreadyCancelledTurnMakesNoModelOrToolRequests()
+    {
+        var client = new CountingToolClient();
+        var tools = new ScriptedTools(_ => Task.FromResult(""));
+        var agent = new AuximAgent(client, new ToolRegistry(), tools);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            agent.RunConversationAsync("do nothing", cancellationToken: new CancellationToken(true)));
+        Assert.Equal(0, tools.Count);
+        Assert.Empty(client.Requests);
+    }
+
+    private sealed class CountingToolClient(Action? onFinalRequest = null) : IToolCallingAgentClient
+    {
+        public List<IReadOnlyList<AgentMessage>> Requests { get; } = [];
+
+        public Task<string> CompleteAsync(IReadOnlyList<AgentMessage> messages, CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<AgentClientResponse> CompleteWithToolsAsync(IReadOnlyList<AgentMessage> messages,
+            IReadOnlyList<ToolDefinition> tools, CancellationToken cancellationToken)
+        {
+            Requests.Add(messages.ToArray());
+            if (Requests.Count == 1)
+                return Task.FromResult(new AgentClientResponse("", [new("first", "echo", "{}"), new("second", "echo", "{}")]));
+            onFinalRequest?.Invoke();
+            return Task.FromResult(new AgentClientResponse("finished", []));
+        }
+    }
+
+    private sealed class ScriptedTools(Func<CancellationToken, Task<string>> invoke) : IRuntimeToolService
+    {
+        public int Count { get; private set; }
+        public IReadOnlyList<AuximRuntimeTool> ListTools() => [];
+        public IReadOnlyList<ResourceAccess> ResolveResourceAccesses(string name, IReadOnlyDictionary<string, object?> arguments) => [];
+
+        public Task<string> InvokeAsync(AuximRunId runId, string toolCallId, string name,
+            IReadOnlyDictionary<string, object?> arguments, string homeDirectory, IApprovalHandler approvalHandler,
+            IRuntimeEventSink eventSink, CancellationToken cancellationToken)
+        {
+            Count++;
+            return invoke(cancellationToken);
+        }
+    }
+
     private sealed class DeniedToolCallAgentClient : IToolCallingAgentClient
     {
         public List<IReadOnlyList<AgentMessage>> Requests { get; } = [];

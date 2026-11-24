@@ -1,4 +1,5 @@
 using Auxim.Core.Runtime;
+using Auxim.Cli.Interactive;
 
 namespace Auxim.Cli;
 
@@ -163,22 +164,28 @@ public static partial class CommandHandlers
         return result;
     }
 
-    private static string ReadSecret(string prompt)
+    private static string? ReadSecret(string prompt)
     {
+        PreparePromptInput();
         Console.Write(prompt);
         if (Console.IsInputRedirected)
         {
-            return Console.ReadLine() ?? "";
+            return CompletePrompt(Console.ReadLine());
         }
 
         var chars = new List<char>();
         while (true)
         {
-            var key = Console.ReadKey(intercept: true);
+            var input = TerminalInput.Read(TerminalInputPolicy.Secret);
+            if (input.Kind == TerminalInputEventKind.EndOfInput) return CompletePrompt(null);
+            if (input.Kind != TerminalInputEventKind.Key) continue;
+            var key = input.Key;
+            if (InteractiveInterrupt.Current is not null && key.Modifiers == ConsoleModifiers.Control && key.Key == ConsoleKey.D)
+                return CompletePrompt(null);
             if (key.Key is ConsoleKey.Enter)
             {
                 Console.WriteLine();
-                return new string(chars.ToArray());
+                return CompletePrompt(new string(chars.ToArray()));
             }
 
             if (key.Key is ConsoleKey.Backspace)
@@ -198,11 +205,27 @@ public static partial class CommandHandlers
         }
     }
 
+    private static void PreparePromptInput()
+    {
+        if (!Console.IsInputRedirected) _ = TerminalInput.KeyAvailable;
+    }
+
+    private static string? ReadPromptLine() => CompletePrompt(new LineEditor([], _ => []).ReadLine("", "",
+        inputPolicy: InteractiveInterrupt.Current is null ? null : TerminalInputPolicy.ConfigurationPrompt));
+
+    private static string? CompletePrompt(string? value)
+    {
+        if (InteractiveInterrupt.Current is null) return value;
+        TerminalInput.ThrowIfConfigurationCancelled();
+        return value ?? throw new EndOfStreamException("Input ended before configuration was complete.");
+    }
+
     private static string PromptWithDefault(string label, string defaultValue)
     {
         var suffix = string.IsNullOrWhiteSpace(defaultValue) ? "" : $" [{defaultValue}]";
+        PreparePromptInput();
         Console.Write($"{label}{suffix}: ");
-        var value = Console.ReadLine();
+        var value = ReadPromptLine();
         return string.IsNullOrWhiteSpace(value) ? defaultValue : value.Trim();
     }
 
@@ -280,8 +303,9 @@ public static partial class CommandHandlers
     {
         while (true)
         {
+            PreparePromptInput();
             Console.Write($"{label} [1-{maxChoice}, default {defaultChoice}]: ");
-            var raw = Console.ReadLine();
+            var raw = ReadPromptLine();
             if (string.IsNullOrWhiteSpace(raw))
             {
                 return defaultChoice;

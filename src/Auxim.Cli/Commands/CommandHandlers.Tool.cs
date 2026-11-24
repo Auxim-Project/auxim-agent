@@ -1,4 +1,5 @@
 using Auxim.Core.Runtime;
+using Auxim.Core.Approval;
 using Auxim.Cli.Interactive;
 
 namespace Auxim.Cli;
@@ -8,6 +9,13 @@ public static partial class CommandHandlers
     public static async Task<int> HandleTool(
         IReadOnlyList<string> args,
         IAuximRuntime runtime)
+    {
+        return await HandleToolWithCancellation(args, runtime, CancellationToken.None);
+    }
+
+    internal static async Task<int> HandleToolWithCancellation(
+        IReadOnlyList<string> args, IAuximRuntime runtime, CancellationToken cancellationToken,
+        IApprovalHandler? approval = null, Action<string>? writeResult = null)
     {
         var subcommand = args.FirstOrDefault() ?? "list";
         switch (subcommand)
@@ -27,10 +35,11 @@ public static partial class CommandHandlers
 
                 var toolName = args[1];
                 var toolArgs = ParseKeyValueArgs(args.Skip(2));
-                Console.WriteLine(await runtime.InvokeToolAsync(
+                var result = await runtime.InvokeToolAsync(
                     toolName,
                     toolArgs,
-                    new AuximRuntimeOptions { ApprovalHandler = new CliApprovalHandler() }));
+                    new AuximRuntimeOptions { ApprovalHandler = approval ?? new CliApprovalHandler() }, cancellationToken);
+                (writeResult ?? Console.WriteLine)(result);
                 return 0;
             default:
                 return PrintToolHelp();

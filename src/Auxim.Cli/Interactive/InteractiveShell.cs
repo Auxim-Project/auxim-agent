@@ -1,22 +1,19 @@
 using Auxim.Core.Runtime;
 using Auxim.Cli.Services;
-using System.Text;
 
 namespace Auxim.Cli.Interactive;
 
 internal static class InteractiveShell
 {
     private static readonly DateTimeOffset StartedAt = DateTimeOffset.Now;
-    private static CancellationTokenSource? _currentTurn;
-    private static IReadOnlyList<string> _transcriptLines = [];
-    private static int _transcriptOffset;
-    private static bool _transcriptMode;
+    private static InteractiveView _view = null!;
     private static IAuximRuntime _runtime = null!;
 
     public static async Task<int> RunAsync(IAuximRuntime runtime)
     {
         _runtime = runtime;
-        Console.CancelKeyPress += OnCancelKeyPress;
+        _view = new InteractiveView(runtime, StartedAt);
+        using var interrupts = InteractiveInterrupt.Enter();
         using var screen = InteractiveScreen.Enter();
         try
         {
@@ -24,37 +21,89 @@ internal static class InteractiveShell
             var editor = new LineEditor(
                 history.Entries,
                 InteractiveCommandCatalog.Complete,
-                ScrollTranscript);
-            PrintDashboard();
+                _view.ScrollTranscript,
+                _view.PrepareInputLayout,
+                () => _view.Page == InteractivePage.NewChat,
+                () => _view.Page is InteractivePage.History or InteractivePage.Resume || _view.HasCommandResult,
+                _view.ScrollWheel,
+                () => _view.CanPointComposer,
+                () => _view.HistoryTextSelection,
+                _view.ToggleHistoryTextSelection,
+                history.KindAt,
+                _view.QuickActionAt,
+                _view.ToggleCommandResultExpansion,
+                _view);
+            _view.Initialize();
 
             while (true)
             {
-                var input = ReadUserInput(editor);
-                if (input is null)
+                var submission = ReadUserInput(editor);
+                if (submission is null)
                 {
                     Console.WriteLine();
                     history.Save();
                     return 0;
                 }
 
-                input = input.Trim();
-                if (input.Length == 0)
+                var input = submission.Kind == InputSubmissionKind.AgentMessage ? submission.Text : submission.Text.Trim();
+                if (string.IsNullOrWhiteSpace(input))
                 {
                     continue;
                 }
 
-                if (input.StartsWith("//", StringComparison.Ordinal))
+                if (submission.Kind == InputSubmissionKind.HostCommand)
                 {
-                    history.Add(input);
+                    history.Add(submission);
                     history.Save();
-                    await RunShellEscapeAsync(input[2..].TrimStart());
+                    await RunForegroundAsync(async () =>
+                    {
+                        using (TerminalInput.Suspend())
+                            await RunShellEscapeAsync(input[2..].TrimStart());
+                        return 0;
+                    });
                     continue;
                 }
 
-                if (input.StartsWith('/'))
+                if (submission.Kind == InputSubmissionKind.CliCommand)
                 {
-                    history.Add(input);
-                    var exitCode = await RunSlashCommandAsync(input);
+                    history.Add(submission);
+                    var parts = InteractiveCommandParser.Tokenize(input[1..]);
+                    var presentation = InteractiveCommandResult.Classify(parts);
+                    var exitCode = 0;
+                    try
+                    {
+                        if (presentation == CommandPresentation.Result)
+                        {
+                            // These branches complete synchronously: no input, tools or approval.
+                            var result = InteractiveCommandResult.Capture(() => RunSlashCommandAsync(parts).GetAwaiter().GetResult());
+                            ApplySessionTransition(parts, result.ExitCode);
+                            _view.ShowCommandResult(parts.FirstOrDefault() ?? "command", result);
+                            exitCode = result.ExitCode;
+                        }
+                        else if (presentation == CommandPresentation.Foreground && parts[0].Equals("tool", StringComparison.OrdinalIgnoreCase)
+                            && parts[1] == "run")
+                            exitCode = await RunDirectToolAsync(parts.Skip(1).ToArray(), interrupts);
+                        else if (presentation == CommandPresentation.Foreground)
+                            exitCode = await RunForegroundAsync(() => RunSlashCommandAsync(parts));
+                        else exitCode = await RunSlashCommandAsync(parts);
+                    }
+                    catch (ConfigurationPromptCancelledException)
+                    {
+                        TerminalInput.DiscardConfigurationInput();
+                        _view.ShowMain();
+                        _view.PrintStatus("Configuration cancelled.");
+                    }
+                    catch (EndOfStreamException exception) when (presentation == CommandPresentation.Foreground
+                        && parts[0].ToLowerInvariant() is "model" or "auth")
+                    {
+                        _view.ShowMain();
+                        _view.PrintStatus(exception.Message);
+                    }
+                    catch (Exception exception)
+                    {
+                        _view.ShowCommandResult(parts.FirstOrDefault() ?? "command",
+                            new InteractiveCommandResult(1, [$"Error: {exception.Message}"]));
+                    }
                     history.Save();
                     if (exitCode == ExitRequested)
                     {
@@ -64,137 +113,146 @@ internal static class InteractiveShell
                     continue;
                 }
 
-                history.Add(input);
+                _view.PrepareConversation();
+                history.Add(submission);
                 history.Save();
                 using var turn = new CancellationTokenSource();
-                _currentTurn = turn;
-                var streamedContent = false;
-                var toolEvents = 0;
+                interrupts.BeginTurn(turn);
                 var started = DateTimeOffset.Now;
-                var streamedResponse = new StringBuilder();
+                await using var preview = _view.BeginStreamingPreview(input);
                 try
                 {
-                    PrintTurnHeader("assistant", $"thinking  {started:HH:mm:ss}");
+                    _view.PrintTurnHeader("assistant", $"thinking  {started:HH:mm:ss}");
                     var runner = new ChatRunner(
                         _runtime,
-                        new DelegateRuntimeEventSink((runtimeEvent, _) =>
-                        {
-                            switch (runtimeEvent)
-                            {
-                                case RuntimeToolStartedEvent or RuntimeToolCompletedEvent:
-                                    toolEvents++;
-                                    PrintToolEvent(runtimeEvent);
-                                    break;
-                                case RuntimeContentDeltaEvent contentDelta:
-                                    streamedContent = true;
-                                    streamedResponse.Append(contentDelta.Delta);
-                                    break;
-                            }
-
-                            return ValueTask.CompletedTask;
-                        }));
-                    var result = await runner.RunAsync(input, turn.Token);
-                    AppendAssistantResponse(streamedContent ? streamedResponse.ToString() : result.FinalResponse);
-                    PrintTurnFooter(started, toolEvents);
+                        new DelegateRuntimeEventSink(preview.PublishAsync), _view);
+                    var result = await interrupts.AwaitTurnAsync(runner.RunAsync(input, turn.Token), _view.MarkCancelling,
+                        _view.UsesFixedLayout ? preview.NavigateAsync : null);
+                    turn.Token.ThrowIfCancellationRequested();
+                    await preview.FinishAsync();
+                    _view.EndRun(response: result.FinalResponse);
+                    _view.AppendAssistantResponse(result.FinalResponse);
+                    _view.PrintTurnFooter(started, preview.ToolEventCount);
                 }
                 catch (OperationCanceledException)
                 {
-                    Console.WriteLine();
-                    Console.WriteLine(Ansi.Warning("Cancelled current turn."));
-                    Console.WriteLine();
+                    await preview.FinishAsync("cancelled");
+                    _view.RetainIncompletePreview(preview.IncompleteLines);
+                    _view.EndRun("Cancelled current turn. Completed tool effects are not undone.");
+                    if (!_view.UsesFixedLayout)
+                    {
+                        Console.WriteLine();
+                        Console.WriteLine("[cancelled preview; not saved]");
+                        foreach (var line in preview.IncompleteLines) Console.WriteLine(TerminalTextLayout.Plain(line));
+                        Console.WriteLine(Ansi.Warning("Cancelled current turn. Completed tool effects are not undone."));
+                        Console.WriteLine();
+                    }
                 }
                 catch (Exception exception)
                 {
-                    Console.WriteLine();
-                    Console.WriteLine(Ansi.Error($"Error: {exception.Message}"));
-                    Console.WriteLine();
+                    await preview.FinishAsync("failed");
+                    _view.RetainIncompletePreview(preview.IncompleteLines);
+                    _view.EndRun($"Error: {exception.Message}");
+                    if (!_view.UsesFixedLayout)
+                    {
+                        Console.WriteLine();
+                        Console.WriteLine(Ansi.Error($"Error: {exception.Message}"));
+                        Console.WriteLine();
+                    }
                 }
                 finally
                 {
-                    _currentTurn = null;
+                    interrupts.EndTurn();
                 }
             }
         }
         finally
         {
-            Console.CancelKeyPress -= OnCancelKeyPress;
+            interrupts.EndTurn();
         }
-    }
-
-    private static void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs args)
-    {
-        if (_currentTurn is not null)
-        {
-            args.Cancel = true;
-            _currentTurn.Cancel();
-            return;
-        }
-        
-        args.Cancel = true;
-        InteractiveScreen.EmergencyCleanup();
-        Console.ResetColor();
-        Console.WriteLine();
-        Console.WriteLine("Exiting (Ctrl+C).");
-        Environment.Exit(0);
-    }
-
-    private static void PrintHeader()
-    {
-        var status = _runtime.GetStatus();
-        ConsoleTheme.Banner("Auxim", "portable C# AI agent");
-        ConsoleTheme.StatusBar(
-            ("model", $"{status.ModelProvider}/{status.ModelName}"),
-            ("session", string.IsNullOrWhiteSpace(status.CurrentSessionId) ? "(new)" : status.CurrentSessionId),
-            ("mode", InteractiveScreen.IsAlternateScreenActive ? "alternate" : "inline"));
-        Console.WriteLine();
-    }
-
-    private static void PrintDashboard()
-    {
-        PrintHeader();
-        ConsoleTheme.Section("Dashboard");
-        PrintRuntimePanel();
-        ConsoleTheme.Section("Actions");
-        ConsoleTheme.ActionList(
-        [
-            new("/help", "command and input reference"),
-            new("/status", "current interface and runtime"),
-            new("/context", "session usage snapshot"),
-            new("/history", "open the conversation history"),
-            new("/jump 1", "start history replay from turn 1"),
-            new("/model show", "active model config"),
-            new("/sandbox show", "VAFS mappings"),
-            new("// git status", "run host shell"),
-        ]);
-        Console.WriteLine();
-        ConsoleTheme.Hint("Type naturally to talk with the agent. Use /paste for multiline input or // for a real shell command.");
-        Console.WriteLine();
-    }
-
-    private static void PrintToolEvent(RuntimeEvent runtimeEvent)
-    {
-        var (name, kind, detail) = runtimeEvent switch
-        {
-            RuntimeToolStartedEvent started => (
-                started.ToolName,
-                "start",
-                $"{started.ResourceAccesses.Count} resource access declarations"),
-            RuntimeToolCompletedEvent completed => (
-                completed.ToolName,
-                completed.Outcome,
-                $"{completed.OutputLength} chars"),
-            _ => ("runtime", runtimeEvent.Kind, ""),
-        };
-        Console.WriteLine();
-        var renderedKind = kind == "succeeded" ? Ansi.Success(kind) : Ansi.Accent(kind);
-        Console.WriteLine($"{ConsoleTheme.Badge($"tool:{name}")} {renderedKind} {Ansi.Muted(detail)}");
     }
 
     private const int ExitRequested = 42;
 
-    private static async Task<int> RunSlashCommandAsync(string input)
+    private static void ApplySessionTransition(IReadOnlyList<string> parts, int code)
     {
-        var parts = SplitCommand(input[1..]);
+        if (code != 0 || parts.FirstOrDefault()?.ToLowerInvariant() != "session") return;
+        if (parts.Skip(1).FirstOrDefault() == "clear") _view.ShowNewChat();
+    }
+
+    private static async Task<int> RunDirectToolAsync(IReadOnlyList<string> args, InteractiveInterrupt interrupts)
+    {
+        using var turn = new CancellationTokenSource();
+        interrupts.BeginTurn(turn);
+        var completedAfterCancellation = false;
+        try
+        {
+            _view.ShowMain();
+            if (_view.UsesFixedLayout)
+            {
+                string output = "";
+                _view.PrintStatus("Running tool   Ctrl+C cancel");
+                var result = await interrupts.AwaitTurnAsync(CommandHandlers.HandleToolWithCancellation(
+                    args, _runtime, turn.Token, new CliApprovalHandler(_view), value => output = value));
+                var status = turn.IsCancellationRequested
+                    ? "Tool completed after a cancellation request. Effects were not rolled back."
+                    : "Tool completed.";
+                _view.ShowCommandResult("tool run", new(result, [status, .. output.ReplaceLineEndings("\n").Split('\n')]));
+                return result;
+            }
+
+            var code = await RunForegroundAsync(async () =>
+            {
+                ConsoleTheme.Hint("Running tool. Ctrl+C requests cancellation; completed effects are not undone.");
+                var result = await interrupts.AwaitTurnAsync(
+                    CommandHandlers.HandleToolWithCancellation(args, _runtime, turn.Token));
+                completedAfterCancellation = turn.IsCancellationRequested;
+                if (completedAfterCancellation)
+                    ConsoleTheme.Hint("Tool completed after a cancellation request. Effects were not rolled back.");
+                return result;
+            });
+            _view.ShowMain();
+            _view.PrintStatus(completedAfterCancellation
+                ? "Tool completed after a cancellation request. Effects were not rolled back." : "Tool completed.");
+            return code;
+        }
+        catch (OperationCanceledException) when (turn.IsCancellationRequested)
+        {
+            _view.ShowMain();
+            _view.ShowCommandResult("tool run", new(130,
+                ["Tool wait cancelled. Effects are not undone; child processes may continue."]));
+            return 130;
+        }
+        catch (Exception exception)
+        {
+            _view.ShowMain();
+            _view.ShowCommandResult("tool run", new(1, [$"Tool failed: {exception.Message}"]));
+            return 1;
+        }
+        finally { interrupts.EndTurn(); }
+    }
+
+    private static async Task<int> RunForegroundAsync(Func<Task<int>> action)
+    {
+        if (!_view.UsesFixedLayout) return await action();
+        _view.SuspendLayout();
+        try
+        {
+            var result = await action();
+            ConsoleTheme.Hint("Press Enter to return to Auxim.");
+            while (true)
+            {
+                var input = TerminalInput.Read(TerminalInputPolicy.LineEditor);
+                if (input.Kind == TerminalInputEventKind.EndOfInput
+                    || input.Kind == TerminalInputEventKind.Key && input.Key.Key == ConsoleKey.Enter) break;
+            }
+            return result;
+        }
+        finally { _view.RestoreLayout(); }
+    }
+
+    private static async Task<int> RunSlashCommandAsync(IReadOnlyList<string> parts)
+    {
         if (parts.Count == 0)
         {
             return 0;
@@ -202,6 +260,23 @@ internal static class InteractiveShell
 
         var command = parts[0].ToLowerInvariant();
         var args = parts.Skip(1).ToArray();
+        if (args is ["help" or "--help" or "-h"]
+            && InteractiveCommandCatalog.Find("/" + command) is { Subcommands: { } subcommands } help)
+        {
+            Console.WriteLine($"/{command} — {help.Description}");
+            if (command == "session")
+            {
+                Console.WriteLine("  /session  Filter, preview and select a saved session");
+                Console.WriteLine("  /session clear  Clear the active selection; keep saved sessions");
+                Console.WriteLine("  /new  Start a new chat");
+            }
+            else
+            {
+                foreach (var subcommand in subcommands)
+                    Console.WriteLine($"  /{command} {subcommand}");
+            }
+            return 0;
+        }
         switch (command)
         {
             case "exit":
@@ -210,39 +285,37 @@ internal static class InteractiveShell
                 return ExitRequested;
             case "help":
             case "?":
-                PrintHelp();
+                _view.PrintHelp();
                 return 0;
             case "new":
-                return CommandHandlers.HandleSession(["new", ..args], _runtime);
+                _view.StartNewSession(string.Join(' ', args));
+                return 0;
             case "context":
             case "usage":
-                PrintContext();
+                _view.PrintContext();
                 return 0;
             case "history":
-                PrintHistory(args);
+                _view.PrintHistory(args);
                 return 0;
             case "show":
-                ShowTurn(args);
+                _view.ShowTurn(args);
                 return 0;
             case "jump":
             case "goto":
-                JumpToTurn(args);
+                _view.JumpToTurn(args);
                 return 0;
             case "tail":
-                TailTurns(args);
-                return 0;
-            case "resume":
-                ResumeDashboard();
+                _view.TailTurns(args);
                 return 0;
             case "status":
-                PrintRuntimePanel();
+                _view.PrintRuntimePanel();
                 return 0;
             case "shortcuts":
-                PrintShortcuts();
+                _view.PrintShortcuts();
                 return 0;
             case "paste":
-                PrintStatus("/paste is only available from the main prompt.");
-                return 0;
+                Console.Error.WriteLine("Usage: /paste (finish the block with . on its own line).");
+                return 1;
             case "model":
                 return CommandHandlers.HandleModel(args, _runtime);
             case "auth":
@@ -250,9 +323,14 @@ internal static class InteractiveShell
             case "config":
                 return CommandHandlers.HandleConfig(args, _runtime);
             case "session":
-                return CommandHandlers.HandleSession(args, _runtime);
-            case "sessions":
-                return CommandHandlers.HandleSession(["list"], _runtime);
+                if (args.Length == 0)
+                {
+                    BrowseSessions();
+                    return 0;
+                }
+                if (args is ["clear"]) return CommandHandlers.HandleSession(args, _runtime);
+                Console.Error.WriteLine("Usage: /session [clear|help]. Use /new to start a new chat.");
+                return 1;
             case "tools":
                 return await CommandHandlers.HandleTool(["list"], _runtime);
             case "tool":
@@ -265,10 +343,10 @@ internal static class InteractiveShell
                 return CommandHandlers.HandleDoctor(_runtime);
             case "clear":
             case "redraw":
-                ResumeDashboard();
+                _view.Redraw();
                 return 0;
             case "welcome":
-                ResumeDashboard();
+                _view.ShowNewChat();
                 return 0;
             default:
                 Console.WriteLine(Ansi.Warning($"Unknown command: /{command}"));
@@ -277,356 +355,109 @@ internal static class InteractiveShell
         }
     }
 
-    private static void PrintHelp()
+    private static void BrowseSessions()
     {
-        ConsoleTheme.Section("Commands");
-        ConsoleTheme.CommandGrid(InteractiveCommandCatalog.Commands);
-
-        ConsoleTheme.Section("Input");
-        ConsoleTheme.Hint("mouse wheel or Up/Down scrolls conversation", "Ctrl+P/Ctrl+N input history", "drag to select text", "Ctrl+D exit");
-        ConsoleTheme.Hint("Left/Right cursor", "Tab completion", "line \\ continues input", "/paste ends with .");
-        ConsoleTheme.Hint("/history opens history", "/show <n> opens one turn", "/jump <n> replays from a turn", "Esc or /resume returns");
-        Console.WriteLine();
-    }
-
-    private static void PrintContext()
-    {
-        var session = _runtime.GetOrCreateCurrentSession();
-        var userMessages = session.Messages.Count(message => message.Role == "user");
-        var assistantMessages = session.Messages.Count(message => message.Role == "assistant");
-        ConsoleTheme.Section("Context");
-        ConsoleTheme.Pair("session", session.Id);
-        ConsoleTheme.Pair("title", session.Title);
-        ConsoleTheme.Pair("messages", session.Messages.Count.ToString());
-        ConsoleTheme.Pair("user turns", userMessages.ToString());
-        ConsoleTheme.Pair("assistant", assistantMessages.ToString());
-        ConsoleTheme.Pair("chars", session.Messages.Sum(message => message.Content.Length).ToString());
-    }
-
-    private static void PrintHistory(IReadOnlyList<string> args)
-    {
-        var turns = GetCurrentTurns();
-        if (turns.Count == 0)
+        if (!_view.OpenResume()) return;
+        if (Console.IsInputRedirected)
         {
-            ConsoleTheme.Hint("No turns in the current session.");
+            Console.Write("Session number or id (empty to go back): ");
+            var selection = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(selection)) _view.NavigateBack();
+            else if (!_view.ResumeNumberOrId(selection.Trim())) _view.NavigateBack();
             return;
         }
-
-        var count = ParsePositiveInt(args.FirstOrDefault(), defaultValue: Math.Min(20, turns.Count));
-        var start = Math.Max(0, turns.Count - count);
-        OpenTranscript(
-            $"Conversation History ({turns.Count} turns)",
-            RenderHistorySummaryToLines(turns.Skip(start)),
-            startAtBottom: false);
-    }
-
-    private static IReadOnlyList<string> RenderHistorySummaryToLines(IEnumerable<SessionTurn> turns)
-    {
-        var lines = new List<string>();
-        foreach (var turn in turns)
+        using var paste = TerminalInput.BeginPasteInput();
+        while (_view.Page is InteractivePage.Resume or InteractivePage.SessionPreview)
         {
-            var user = OneLine(turn.User.Content, 72);
-            var assistant = OneLine(turn.Assistant?.Content ?? "(no assistant response)", 72);
-            lines.Add($"{Ansi.Accent(turn.Number.ToString().PadLeft(3))} {Ansi.Bold("you")}       {user}");
-            lines.Add($"    {Ansi.Muted("assistant")} {Ansi.Muted(assistant)}");
-            lines.Add("");
-        }
-
-        lines.Add(ConsoleTheme.RuleText());
-        lines.Add(Ansi.Muted("/show <n> shows one turn  /jump <n> replays from that turn  /tail <n> replays recent turns  Esc or /resume returns"));
-        return lines;
-    }
-
-    private static void ShowTurn(IReadOnlyList<string> args)
-    {
-        var turn = FindTurn(args.FirstOrDefault());
-        if (turn is null)
-        {
-            return;
-        }
-
-        RenderTurn(turn);
-    }
-
-    private static void JumpToTurn(IReadOnlyList<string> args)
-    {
-        var turns = GetCurrentTurns();
-        if (!TryParseTurnNumber(args.FirstOrDefault(), turns.Count, out var turnNumber))
-        {
-            return;
-        }
-
-        OpenTranscript(
-            $"History from turn {turnNumber}",
-            RenderTurnsToLines(turns.Where(turn => turn.Number >= turnNumber)),
-            startAtBottom: false);
-    }
-
-    private static void TailTurns(IReadOnlyList<string> args)
-    {
-        var turns = GetCurrentTurns();
-        var count = ParsePositiveInt(args.FirstOrDefault(), defaultValue: Math.Min(5, turns.Count));
-        var start = Math.Max(1, turns.Count - count + 1);
-        JumpToTurn([start.ToString()]);
-    }
-
-    private static void OpenConversationScrollback(Action? redrawPrompt = null)
-    {
-        var turns = GetCurrentTurns();
-        if (turns.Count == 0)
-        {
-            PrintStatus("No conversation history in the current session.");
-            redrawPrompt?.Invoke();
-            return;
-        }
-
-        OpenTranscript("Conversation history", RenderTurnsToLines(turns), startAtBottom: true, redrawPrompt);
-    }
-
-    private static SessionTurn? FindTurn(string? rawNumber)
-    {
-        var turns = GetCurrentTurns();
-        if (!TryParseTurnNumber(rawNumber, turns.Count, out var turnNumber))
-        {
-            return null;
-        }
-
-        return turns.First(turn => turn.Number == turnNumber);
-    }
-
-    private static bool TryParseTurnNumber(string? rawNumber, int maxTurn, out int turnNumber)
-    {
-        turnNumber = 0;
-        if (!int.TryParse(rawNumber, out var parsed) || parsed < 1 || parsed > maxTurn)
-        {
-            Console.WriteLine(Ansi.Warning(maxTurn == 0
-                ? "Current session has no turns."
-                : $"Usage: /show <1-{maxTurn}> or /jump <1-{maxTurn}>"));
-            return false;
-        }
-
-        turnNumber = parsed;
-        return true;
-    }
-
-    private static int ParsePositiveInt(string? raw, int defaultValue)
-    {
-        return int.TryParse(raw, out var value) && value > 0 ? value : defaultValue;
-    }
-
-    private static IReadOnlyList<SessionTurn> GetCurrentTurns()
-    {
-        var session = _runtime.GetOrCreateCurrentSession();
-        var turns = new List<SessionTurn>();
-        AgentMessage? pendingUser = null;
-        foreach (var message in session.Messages)
-        {
-            if (message.Role == "user")
+            // Same serial input ownership as the editor and approval prompt.
+            if (!TerminalInput.KeyAvailable)
             {
-                if (pendingUser is not null)
-                {
-                    turns.Add(new SessionTurn(turns.Count + 1, pendingUser, null));
-                }
-
-                pendingUser = message;
+                _view.PrepareInputLayout();
+                _view.TickHistorySelection();
+                Thread.Sleep(25);
                 continue;
             }
-
-            if (message.Role == "assistant" && pendingUser is not null)
+            var input = TerminalInput.Read(_view.CanInteractWithHistory ? TerminalInputPolicy.HistoryEditor : TerminalInputPolicy.LineEditor);
+            if (input.Kind == TerminalInputEventKind.EndOfInput) { _view.ShowMain(); return; }
+            if (_view.Page == InteractivePage.SessionPreview)
             {
-                turns.Add(new SessionTurn(turns.Count + 1, pendingUser, message));
-                pendingUser = null;
+                if (_view.HandleHistoryInput(input)) continue;
+                if (input.Kind == TerminalInputEventKind.MouseWheel)
+                    _view.ScrollWheel(input.ScrollDelta * 3, static () => { });
+                if (input.Kind != TerminalInputEventKind.Key) continue;
+                if (input.Key is { Key: ConsoleKey.R, Modifiers: ConsoleModifiers.Control })
+                    _view.ToggleHistoryTextSelection();
+                if (input.Key.Modifiers != 0) continue;
+                switch (input.Key.Key)
+                {
+                    case ConsoleKey.LeftArrow:
+                    case ConsoleKey.Escape: _view.NavigateBack(); break;
+                    case ConsoleKey.Enter: _view.ResumeSession(); break;
+                    case ConsoleKey.F2: _view.ToggleHistoryTextSelection(); break;
+                    case ConsoleKey.UpArrow: _view.ScrollSessionPreview(-1); break;
+                    case ConsoleKey.DownArrow: _view.ScrollSessionPreview(1); break;
+                    case ConsoleKey.PageUp: _view.ScrollSessionPreview(-1, byPage: true); break;
+                    case ConsoleKey.PageDown: _view.ScrollSessionPreview(1, byPage: true); break;
+                }
+                continue;
+            }
+            if (input.Kind == TerminalInputEventKind.Pointer && input.Pointer is { } pointer)
+            {
+                _view.SelectResumeAt(pointer);
+                continue;
+            }
+            if (input.Kind == TerminalInputEventKind.MouseWheel)
+            {
+                _view.MoveResumeSelection(input.ScrollDelta);
+                continue;
+            }
+            if (input.Kind == TerminalInputEventKind.Paste)
+            {
+                if (input.Text is { } text) _view.AppendResumeQuery(text);
+                continue;
+            }
+            if (input.Kind != TerminalInputEventKind.Key) continue;
+            switch (input.Key.Key)
+            {
+                case ConsoleKey.Backspace: _view.DeleteResumeQueryElement(); break;
+                case ConsoleKey.U when input.Key.Modifiers == ConsoleModifiers.Control: _view.SetResumeQuery(""); break;
+                case ConsoleKey.UpArrow: _view.MoveResumeSelection(-1); break;
+                case ConsoleKey.DownArrow: _view.MoveResumeSelection(1); break;
+                case ConsoleKey.RightArrow when input.Key.Modifiers == 0: _view.OpenSessionPreview(); break;
+                case ConsoleKey.Enter when input.Key.Modifiers == 0: _view.ResumeSession(); break;
+                case ConsoleKey.Escape:
+                    _view.NavigateBack();
+                    TerminalInput.DiscardQueuedNavigation();
+                    break;
+                default:
+                    if (!char.IsControl(input.Key.KeyChar)
+                        && (input.Key.Modifiers & (ConsoleModifiers.Alt | ConsoleModifiers.Control)) == 0)
+                        _view.AppendResumeQuery(input.Key.KeyChar.ToString());
+                    break;
             }
         }
-
-        if (pendingUser is not null)
-        {
-            turns.Add(new SessionTurn(turns.Count + 1, pendingUser, null));
-        }
-
-        return turns;
     }
 
-    private static void RenderTurn(SessionTurn turn)
+    private static InputSubmission? ReadUserInput(LineEditor editor)
     {
-        OpenTranscript($"Turn {turn.Number}", RenderTurnsToLines([turn]), startAtBottom: false);
-    }
-
-    private static void AppendAssistantResponse(string response)
-    {
-        var turns = GetCurrentTurns();
-        if (turns.Count == 0)
-        {
-            PrintStatus("No conversation to append to.");
-            return;
-        }
-
-        OpenTranscript(
-            "Conversation history",
-            RenderTurnsToLines(turns),
-            startAtBottom: true);
-    }
-
-    private static void OpenTranscript(string title, IReadOnlyList<string> lines, bool startAtBottom, Action? redrawPrompt = null)
-    {
-        _transcriptLines = BuildTranscriptFrame(title, lines);
-        _transcriptOffset = startAtBottom ? Math.Max(0, _transcriptLines.Count - TranscriptPageHeight()) : 0;
-        _transcriptMode = true;
-        InteractiveScreen.SetHistoryScrollActive(active: true);
-        RenderTranscriptViewport(redrawPrompt);
-    }
-
-    private static void ScrollTranscript(int delta, Action redrawPrompt)
-    {
-        if (!_transcriptMode)
-        {
-            OpenConversationScrollback(redrawPrompt);
-            return;
-        }
-
-        _transcriptOffset += delta;
-        RenderTranscriptViewport(redrawPrompt);
-    }
-
-    private static void ResumeDashboard()
-    {
-        _transcriptMode = false;
-        _transcriptLines = [];
-        _transcriptOffset = 0;
-        InteractiveScreen.SetHistoryScrollActive(active: false);
-        InteractiveScreen.Clear();
-        PrintDashboard();
-    }
-
-    private static void RenderTranscriptViewport(Action? redrawPrompt = null)
-    {
-        var height = TranscriptPageHeight();
-        _transcriptOffset = Math.Clamp(_transcriptOffset, 0, Math.Max(0, _transcriptLines.Count - height));
-        InteractiveScreen.Clear();
-        foreach (var line in _transcriptLines.Skip(_transcriptOffset).Take(height))
-        {
-            Console.WriteLine(line);
-        }
-
-        Console.WriteLine(ConsoleTheme.RuleText());
-        ConsoleTheme.Hint(
-            $"lines {_transcriptOffset + 1}-{Math.Min(_transcriptLines.Count, _transcriptOffset + height)} / {_transcriptLines.Count}",
-            "mouse wheel, Up/Down, or PageUp/PageDown scrolls history",
-            "drag to select text",
-            "Esc or /resume returns");
-        Console.WriteLine();
-
-        redrawPrompt?.Invoke();
-    }
-
-    private static IReadOnlyList<string> BuildTranscriptFrame(string title, IReadOnlyList<string> lines)
-    {
-        var framed = new List<string>
-        {
-            $"{ConsoleTheme.Badge("history")} {Ansi.Bold(title)}",
-            ConsoleTheme.RuleText(),
-        };
-        framed.AddRange(lines);
-        return framed;
-    }
-
-    private static int TranscriptPageHeight()
-    {
-        if (Console.IsOutputRedirected)
-        {
-            return int.MaxValue;
-        }
-
-        try
-        {
-            return Math.Max(8, Console.WindowHeight - 6);
-        }
-        catch (IOException)
-        {
-            return 20;
-        }
-    }
-
-    private static IReadOnlyList<string> RenderTurnsToLines(IEnumerable<SessionTurn> turns)
-    {
-        var lines = new List<string>();
-        foreach (var turn in turns)
-        {
-            lines.Add("");
-            lines.Add($"{ConsoleTheme.Badge($"turn:{turn.Number}")} {Ansi.Bold("you")}");
-            lines.Add(ConsoleTheme.RuleText());
-            lines.AddRange(MarkdownConsoleRenderer.RenderToLines(turn.User.Content));
-            lines.Add("");
-            lines.Add($"{ConsoleTheme.Badge($"turn:{turn.Number}")} {Ansi.Bold("assistant")}");
-            lines.Add(ConsoleTheme.RuleText());
-            lines.AddRange(turn.Assistant is null
-                ? [Ansi.Muted("(no assistant response)")]
-                : MarkdownConsoleRenderer.RenderToLines(turn.Assistant.Content));
-            lines.Add(ConsoleTheme.RuleText());
-        }
-
-        return lines;
-    }
-
-    private static string OneLine(string text, int maxLength)
-    {
-        var value = text.ReplaceLineEndings(" ").Trim();
-        return value.Length <= maxLength ? value : value[..Math.Max(0, maxLength - 3)] + "...";
-    }
-
-    private static void PrintRuntimePanel()
-    {
-        var status = _runtime.GetStatus();
-        var session = _runtime.GetOrCreateCurrentSession();
-        var screenMode = InteractiveScreen.IsAlternateScreenActive ? "alternate" : "inline";
-        ConsoleTheme.Panel("Runtime", [
-            ("model", $"{status.ModelProvider}/{status.ModelName}"),
-            ("session", $"{session.Id} ({session.Messages.Count} messages)"),
-            ("workspace", status.Workspace),
-            ("mounts", status.MountCount.ToString()),
-            ("agent shell", "VAShell policy"),
-            ("ui", screenMode),
-            ("uptime", FormatDuration(DateTimeOffset.Now - StartedAt)),
-        ]);
-    }
-
-    private static void PrintShortcuts()
-    {
-        ConsoleTheme.Section("Shortcuts");
-        ConsoleTheme.Pair("Mouse wheel", "open and scroll conversation history");
-        ConsoleTheme.Pair("Mouse drag", "select text for copying in your terminal");
-        ConsoleTheme.Pair("PageUp/PageDown", "scroll history without leaving the prompt");
-        ConsoleTheme.Pair("Up/Down", "open and scroll conversation history");
-        ConsoleTheme.Pair("Ctrl+P/Ctrl+N", "browse input history");
-        ConsoleTheme.Pair("Alt+Up/Down", "browse input history");
-        ConsoleTheme.Pair("Left/Right", "move cursor");
-        ConsoleTheme.Pair("Home/End", "jump to line boundary");
-        ConsoleTheme.Pair("Tab", "complete slash commands");
-        ConsoleTheme.Pair("Ctrl+C", "cancel active model/tool/shell turn");
-        ConsoleTheme.Pair("Ctrl+D", "exit from an empty prompt");
-        ConsoleTheme.Pair("\\", "continue input on the next line");
-        ConsoleTheme.Pair("//", "run the rest of the line in the real shell");
-        ConsoleTheme.Pair("/history", "list turn numbers in the current session");
-        ConsoleTheme.Pair("/jump n", "clear and replay conversation from turn n");
-        ConsoleTheme.Pair("Esc", "return to dashboard from history");
-        ConsoleTheme.Pair("/resume", "return to dashboard");
-    }
-
-    private static string? ReadUserInput(LineEditor editor)
-    {
-        InteractiveScreen.SetHistoryScrollActive(active: true);
+        _view.ApplyMousePolicy();
+        _view.SyncHistoryCopyControl();
         string? input;
         try
         {
             input = editor.ReadLine(
                 Prompt(),
                 PromptVisible(),
-                escapeReturnsImmediately: () => _transcriptMode,
-                scrollNavigation: true);
+                canNavigateBack: () => _view.CanGoBack,
+                scrollNavigation: true,
+                navigateBack: _view.NavigateBack,
+                acceptPaste: true);
+            if (input is not null) _view.CloseCommandResult();
         }
         finally
         {
-            // Do not leave wheel-generated cursor keys queued while a model,
+            TerminalInput.SetHistoryCopyControl(false);
+            // Do not leave mouse reports or navigation keys queued while a model,
             // tool, approval prompt, or child process owns the foreground.
             InteractiveScreen.SetHistoryScrollActive(active: false);
         }
@@ -636,20 +467,21 @@ internal static class InteractiveShell
             return null;
         }
 
-        if (input.Trim() == "/paste")
-        {
-            return ReadPasteBlock(editor);
-        }
+        var submission = editor.Submission ?? throw new InvalidOperationException("Missing input submission type.");
+        var paste = submission.Kind == InputSubmissionKind.CliCommand
+            && input.Trim().Equals("/paste", StringComparison.OrdinalIgnoreCase);
+        if (editor.SubmittedPaste || !paste && !input.EndsWith('\\')) return submission;
+        _view.SuspendLayout();
+        try { return new(paste ? ReadPasteBlock(editor) : ReadContinuedInput(editor, input), InputSubmissionKind.AgentMessage); }
+        finally { _view.RestoreLayout(); }
+    }
 
-        if (!input.EndsWith('\\'))
-        {
-            return input;
-        }
-
+    private static string ReadContinuedInput(LineEditor editor, string input)
+    {
         var lines = new List<string> { input[..^1] };
         while (true)
         {
-            var continuation = editor.ReadLine(ContinuationPrompt(), ContinuationPromptVisible());
+            var continuation = editor.ReadLine(ContinuationPrompt(), ContinuationPromptVisible(), acceptPaste: true);
             if (continuation is null)
             {
                 return string.Join(Environment.NewLine, lines);
@@ -673,7 +505,7 @@ internal static class InteractiveShell
         var lines = new List<string>();
         while (true)
         {
-            var line = editor.ReadLine(ContinuationPrompt(), ContinuationPromptVisible());
+            var line = editor.ReadLine(ContinuationPrompt(), ContinuationPromptVisible(), acceptPaste: true);
             if (line is null || line == ".")
             {
                 break;
@@ -693,30 +525,10 @@ internal static class InteractiveShell
 
     private static string ContinuationPromptVisible() => "     > ";
 
-    private static void PrintStatus(string text)
-    {
-        Console.WriteLine($"{ConsoleTheme.Badge("status")} {Ansi.Muted(text)}");
-    }
-
-    private static void PrintTurnHeader(string role, string status)
-    {
-        Console.WriteLine();
-        Console.WriteLine($"{ConsoleTheme.Badge(role)} {Ansi.Muted(status)}");
-        ConsoleTheme.Rule();
-    }
-
-    private static void PrintTurnFooter(DateTimeOffset started, int toolEvents)
-    {
-        Console.WriteLine();
-        ConsoleTheme.Rule();
-        ConsoleTheme.Hint($"done in {FormatDuration(DateTimeOffset.Now - started)}", $"{toolEvents} tool events");
-        Console.WriteLine();
-    }
-
     private static async Task RunShellEscapeAsync(string command)
     {
         using var turn = new CancellationTokenSource();
-        _currentTurn = turn;
+        InteractiveInterrupt.Current!.BeginTurn(turn);
         var started = DateTimeOffset.Now;
         try
         {
@@ -729,7 +541,7 @@ internal static class InteractiveShell
                 Console.WriteLine($"{ConsoleTheme.Badge("shell")} {Ansi.Warning($"exit code {exitCode}")}");
             }
             ConsoleTheme.Rule();
-            ConsoleTheme.Hint($"done in {FormatDuration(DateTimeOffset.Now - started)}");
+            ConsoleTheme.Hint($"done in {InteractiveView.FormatDuration(DateTimeOffset.Now - started)}");
             Console.WriteLine();
         }
         catch (OperationCanceledException)
@@ -745,30 +557,8 @@ internal static class InteractiveShell
         }
         finally
         {
-            _currentTurn = null;
+            InteractiveInterrupt.Current!.EndTurn();
             TerminalMouse.Reset();
         }
     }
-
-    private static string FormatDuration(TimeSpan duration)
-    {
-        if (duration < TimeSpan.Zero)
-        {
-            duration = TimeSpan.Zero;
-        }
-
-        return duration.TotalSeconds < 1
-            ? $"{duration.TotalMilliseconds:N0} ms"
-            : $"{duration.TotalSeconds:N1} s";
-    }
-
-    private static IReadOnlyList<string> SplitCommand(string input)
-    {
-        return InteractiveCommandParser.Tokenize(input);
-    }
 }
-
-internal sealed record SessionTurn(
-    int Number,
-    AgentMessage User,
-    AgentMessage? Assistant);

@@ -5,6 +5,7 @@ using Auxim.Agent;
 using Auxim.Core.Runtime;
 
 ConsoleHost.Configure();
+if (args is ["--diagnose-input"]) return TerminalInputDiagnostic.Run();
 IAuximRuntime runtime = AuximApplication.CreateRuntime();
 
 try
@@ -32,14 +33,7 @@ try
             return 0;
         }
         case "tools":
-        {
-            foreach (var tool in runtime.ListTools())
-            {
-                Console.WriteLine($"{tool.Name} [{tool.Toolset}] - {tool.Description}");
-            }
-
-            return 0;
-        }
+            return await CommandHandlers.HandleTool(["list"], runtime);
         case "model":
             return CommandHandlers.HandleModel(args.Skip(1).ToArray(), runtime);
         case "auth":

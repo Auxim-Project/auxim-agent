@@ -1,4 +1,5 @@
 using Auxim.Core.Runtime;
+using Auxim.Cli.Interactive;
 
 namespace Auxim.Cli;
 
@@ -73,22 +74,26 @@ public static partial class CommandHandlers
         var baseUrl = selectedProvider.IsCustom
             ? defaultBaseUrl
             : PromptWithDefault("Base URL", defaultBaseUrl);
-        var updated = runtime.SetModelSettings(selectedProvider.Id, modelName, baseUrl);
-        Console.WriteLine();
-        Console.WriteLine($"Model saved to {updated.ConfigPath}");
-
-        var credential = runtime.GetCredentialStatus(updated.Provider);
+        // The interactive shell can abort at any prompt, including hidden key entry.
+        // Keep the standalone command's existing save order.
+        var inShell = InteractiveInterrupt.Current is not null;
+        var updated = inShell ? null : SaveModel();
+        var credential = runtime.GetCredentialStatus(updated?.Provider ?? selectedProvider.Id);
+        string? key = null;
         if (credential.Required
             && !credential.Configured
             && IsYes(PromptWithDefault("Save API key now?", "yes")))
         {
-            var key = ReadSecret($"{credential.EnvironmentVariable}: ");
-            if (!string.IsNullOrWhiteSpace(key))
-            {
-                runtime.SetApiKey(updated.Provider, key);
-                credential = runtime.GetCredentialStatus(updated.Provider);
-                Console.WriteLine($"API key saved to {credential.SecretsPath}");
-            }
+            key = ReadSecret($"{credential.EnvironmentVariable}: ");
+        }
+
+        if (inShell) TerminalInput.ThrowIfConfigurationCancelled();
+        updated ??= SaveModel();
+        if (!string.IsNullOrWhiteSpace(key))
+        {
+            runtime.SetApiKey(updated.Provider, key);
+            credential = runtime.GetCredentialStatus(updated.Provider);
+            Console.WriteLine($"API key saved to {credential.SecretsPath}");
         }
 
         PrintPanel(
@@ -102,6 +107,14 @@ public static partial class CommandHandlers
                 "Try: ./auxim chat \"hello\"",
             ]);
         return 0;
+
+        AuximModelSettings SaveModel()
+        {
+            var settings = runtime.SetModelSettings(selectedProvider.Id, modelName, baseUrl);
+            Console.WriteLine();
+            Console.WriteLine($"Model saved to {settings.ConfigPath}");
+            return settings;
+        }
     }
 
     private static void PrintModel(AuximModelSettings model)
